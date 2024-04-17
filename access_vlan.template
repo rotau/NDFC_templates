@@ -1,0 +1,33 @@
+##template properties
+name =access_vlan;
+description = ;
+tags = ;
+userDefined = false;
+supportedPlatforms = N9K;
+templateType = POLICY;
+templateSubType = INTERFACE;
+contentType = TEMPLATE_CLI;
+implements = ;
+dependencies = ;
+published = false;
+imports = ;
+##
+##template variables
+
+#    Copyright (c) 2018 by Cisco Systems, Inc.
+#    All rights reserved.
+
+@(DisplayName="Access Interface", Description="Access host port")
+interface INTF_NAME;
+
+@(DisplayName="Access Vlan", Description="VLAN for this access port")
+string ACCESS_VLAN;
+
+##
+##template content
+
+interface $$INTF_NAME$$
+  switchport access vlan $$ACCESS_VLAN$$
+
+##
+

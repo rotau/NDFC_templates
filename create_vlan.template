@@ -1,0 +1,63 @@
+##template properties
+name =create_vlan;
+description = Create a vlan, provide a name and mode optionally;
+tags = ;
+userDefined = false;
+supportedPlatforms = All;
+templateType = POLICY;
+templateSubType = DEVICE;
+contentType = TEMPLATE_CLI;
+implements =implements;
+dependencies = ;
+published = false;
+imports = ;
+##
+##template variables
+
+#    Copyright (c) 2020 by Cisco Systems, Inc.
+#    All rights reserved.
+
+@(DisplayName="VLAN ID", Description="VLAN Identifier")
+integer VLAN {
+  min = 2;
+  max = 4094;
+};
+
+@(IsMandatory=false, DisplayName="VLAN Name", Description = "if > 32 chars enable:system vlan long-name")
+string NAME {
+  regularExpr=^[^\?,\\,\s]*$;
+  minLength = 0;
+  maxLength = 128;
+};
+
+@(IsMandatory=false, DisplayName="VLAN Mode", Description="Mode CE or FABRICPATH")
+enum MODE {
+  validValues=CE,FABRICPATH;
+  defaultValue=CE;
+};
+
+@(IsMandatory=false, DisplayName="VNI", Description="Virtual Network Identifier (1-16777214)")
+long VNI {
+  min = 1;
+  max = 16777214;
+};
+
+##
+##template content
+
+vlan $$VLAN$$
+
+if ($$NAME$$ != "") {
+  name $$NAME$$
+} 
+
+if ($$MODE$$ == "FABRICPATH") {
+  mode fabricpath
+}
+
+if ($$VNI$$ != "") {
+  vn-segment $$VNI$$
+}
+
+##
+

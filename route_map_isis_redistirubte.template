@@ -1,0 +1,66 @@
+##template properties
+name =route_map_isis_redistirubte;
+description = ;
+tags = ;
+userDefined = true;
+supportedPlatforms = N9K;
+templateType = POLICY;
+templateSubType = DEVICE;
+contentType = TEMPLATE_CLI;
+implements = ;
+dependencies = ;
+published = false;
+imports = ;
+##
+##template variables
+#    Copyright (c) 2020 by Cisco Systems, Inc.
+#    All rights reserved.
+
+@(DisplayName="Route Map Name", Description="Name of route map with max. 63 characters, example route_map_test")
+string ROUTE_MAP_NAME {
+    maxLength = 63;
+};
+
+@(DisplayName="Route Map Action", Description="Route map permit or deny operation")
+enum ROUTE_MAP_ACTION {
+    validValues=permit,deny;
+    defaultValue=permit;
+};
+
+@(IsMandatory=false, DisplayName="IP Version", Description="IP version ip or ipv6")
+enum IP_VERSION {
+    validValues=ip,ipv6;
+    defaultValue=ip;
+};
+
+@(DisplayName="Route Map Sequence Number", Description="Route map match sequence number, example 10")
+integer SEQ_NUM {
+    min = 0;
+    max = 65535;
+    defaultValue=10;
+};
+
+@(IsMandatory=false, DisplayName="ACL/Prefix-List Name", Description="Name of ACL or Prefix-List with max. 63 characters, example acl_test")
+string ACL_NAME {
+    maxLength = 63;
+};
+
+@(IsMandatory=false, DisplayName="Match Route Using Prefix-List", Description="True if using Prefix-List to match address of route, False if using ACL")
+boolean MATCH_PREFIX_LIST {
+    defaultValue=false;
+};
+
+##
+##template content
+
+route-map $$ROUTE_MAP_NAME$$ $$ROUTE_MAP_ACTION$$ $$SEQ_NUM$$
+if ($$MATCH_PREFIX_LIST$$ == "" || $$MATCH_PREFIX_LIST$$ == "false") {
+ if ($$ACL_NAME$$ != "") {
+  match $$IP_VERSION$$ address $$ACL_NAME$$
+ }
+}
+else {
+  match $$IP_VERSION$$ address prefix-list $$ACL_NAME$$
+}
+  
+##

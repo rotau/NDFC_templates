@@ -53,6 +53,8 @@ boolean MATCH_PREFIX_LIST {
 ##
 ##template content
 
+access-list $$ACL_NAME$$ permit $$IP_addr_redis$$ $$subnet_mask_redis$$
+
 route-map $$ROUTE_MAP_NAME$$ $$ROUTE_MAP_ACTION$$ $$SEQ_NUM$$
 if ($$MATCH_PREFIX_LIST$$ == "" || $$MATCH_PREFIX_LIST$$ == "false") {
  if ($$ACL_NAME$$ != "") {

@@ -19,8 +19,11 @@ imports = ;
 @(IsMandatory=false, DisplayName="IP subnet to redistribute", Description="IP address to redistribute")
 ipV4Address IP_addr_redis;
 
-@(IsMandatory=false, DisplayName="Subnet mask of redistributed subnet", Description="Subnet mask for redistributed IP")
-ipV4Address subnet_mask_redis;
+@(IsMandatory=false, DisplayName="Subnet bit mask of redistributed subnet", Description="Subnet bit mask for redistributed IP")
+integer subnet_bit_redis {
+    min = 0;
+    max = 32;
+};
 
 @(DisplayName="Route Map Name", Description="Name of route map with max. 63 characters, example route_map_test")
 string ROUTE_MAP_NAME {
@@ -59,7 +62,7 @@ boolean MATCH_PREFIX_LIST {
 ##
 ##template content
 
-access-list $$ACL_NAME$$ permit $$IP_addr_redis$$ $$subnet_mask_redis$$
+ip prefix-list $$ACL_NAME$$ permit $$IP_addr_redis$$/$$subnet_bit_redis$$
 
 route-map $$ROUTE_MAP_NAME$$ $$ROUTE_MAP_ACTION$$ $$SEQ_NUM$$
 if ($$MATCH_PREFIX_LIST$$ == "" || $$MATCH_PREFIX_LIST$$ == "false") {

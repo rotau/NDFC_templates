@@ -16,6 +16,12 @@ imports = ;
 #    Copyright (c) 2020 by Cisco Systems, Inc.
 #    All rights reserved.
 
+@(IsMandatory=false, DisplayName="IP subnet to redistribute", Description="IP address to redistribute")
+ipV4Address IP_addr_redis;
+
+@(IsMandatory=false, DisplayName="Subnet mask of redistributed subnet", Description="Subnet mask for redistributed IP")
+ipV4Address subnet_mask_redis;
+
 @(DisplayName="Route Map Name", Description="Name of route map with max. 63 characters, example route_map_test")
 string ROUTE_MAP_NAME {
     maxLength = 63;

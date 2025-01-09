@@ -1,0 +1,3117 @@
+##template properties
+name =fabric_utility_11_1;
+description = ;
+tags = ;
+userDefined = true;
+supportedPlatforms = All;
+templateType = POLICY;
+templateSubType = NA;
+contentType = PYTHON;
+implements = ;
+dependencies = ;
+published = false;
+imports = ;
+##
+##template variables
+
+#    Copyright (c) 2018-2023 by Cisco Systems, Inc.
+#    All rights reserved.
+
+##
+##template content
+
+from com.cisco.dcbu.vinci.rest.services.jython import *
+from com.cisco.dcbu.topdown.dao import CommonDAO
+from com.cisco.dcbu.pti.resource import CtrlPolicySearch
+from com.cisco.dcbu.vinci.rest.services.jython import MfdWrapper
+from com.cisco.dcbu.vinci.rest.services.jython import TopDownOverlayWrapper
+
+from topology import *
+from utility import *
+from underlay import *
+
+import sys
+import re
+import glob
+import os
+import json
+import logging
+import datetime
+import time
+import ast
+
+AAA_CONF_DESCRIPTION = "AAA configurations"
+BROWNFIELD_AAA_CONF_DESCRIPTION = "DCNM AAA extra configurations"
+TEMPLATE_DME_INTF_STATS_LOAD_INTERVAL = "dme_intf_stats_interval"
+
+def getFabErrEntity(fnName, entityName=None):
+    if entityName:
+        return fnName + ":" + entityName
+    else:
+        return fnName
+
+def isVirtualVPCSwitch(FABRIC_NAME, sn):
+    funcName = sys._getframe(0).f_code.co_name
+    isSwitchVPC = Util.exe(VpcWrapper.isVpc(FABRIC_NAME, sn))
+    if isSwitchVPC:
+        try:
+            vpcType = Util.exe(VpcWrapper.get(VPCMetaDataType.PEERLINK_TYPE, "", sn))
+            if vpcType == VPCMetaDataType.VIRTUAL_PEERLINK:
+                return True 
+        except: 
+            Wrapper.print("%s() template [%s] Seems Upgrade path :"%(funcName, "Easy_Fabric_Extn"))
+    return False   
+
+def isSeedSwitch(sn):
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(sn)
+    srchOpt.setEntityType("SWITCH")
+    srchOpt.setTemplateName("seed_switch")
+    # ignore the PTI source
+    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    isSeed = False
+    if len(ptiList) > 0:
+        isSeed = True
+
+    return isSeed
+
+def isEasyFabricInbandPoapEnabled(dictObj):
+    ffType = dictObj.get("FF", "")
+    if ffType != "Easy_Fabric":
+        return "false"
+        
+    inbandMgmt = dictObj.get("INBAND_MGMT", "false")
+    bootstrapPOAPEnable = dictObj.get("BOOTSTRAP_ENABLE", "false")
+
+    return ("true" if (inbandMgmt == "true" and bootstrapPOAPEnable == "true") else "false")
+
+def validateFabricSetting(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        FF                      = dictObj.get("FF")
+        REPLICATION_MODE        = dictObj.get("REPLICATION_MODE", "Multicast")
+        FABRIC_INTERFACE_TYPE   = dictObj["FABRIC_INTERFACE_TYPE"]
+        LINK_STATE_ROUTING      = dictObj["LINK_STATE_ROUTING"]
+        FABRIC_NAME             = dictObj["FABRIC_NAME"]
+        devices                 = dictObj["DEVICES"]
+        if FF == "Easy_Fabric_IPFM":
+            BGP_LB_ID           = dictObj["ROUTING_LB_ID"]
+            ENABLE_NBM_PASSIVE  = dictObj["ENABLE_NBM_PASSIVE"]
+            ENABLE_ASM          = dictObj["ENABLE_ASM"]
+        else:
+            BGP_LB_ID           = dictObj["BGP_LB_ID"]
+        BGP_AUTH_ENABLE         = dictObj.get("BGP_AUTH_ENABLE", "false")
+        BGP_AUTH_KEY_TYPE       = dictObj.get("BGP_AUTH_KEY_TYPE", "3")
+        BGP_AUTH_KEY            = dictObj.get("BGP_AUTH_KEY", "")
+        OSPF_AUTH_ENABLE        = dictObj.get("OSPF_AUTH_ENABLE", "false")
+        OSPF_AUTH_KEY_ID        = dictObj.get("OSPF_AUTH_KEY_ID", "127")
+        OSPF_AUTH_KEY           = dictObj.get("OSPF_AUTH_KEY", "")
+        ENABLE_TENANT_DHCP      = dictObj.get("ENABLE_TENANT_DHCP", "true")
+        topologyDataObj         = dictObj.get("topologyObj")
+        ENABLE_EVPN             = dictObj.get("ENABLE_EVPN", "true")
+        MPLS_HANDOFF            = dictObj.get("MPLS_HANDOFF", "false")
+        FEATURE_PTP             = dictObj.get("FEATURE_PTP", "false")
+        SUPER_SPINE_BGP_AS      = dictObj.get("SUPER_SPINE_BGP_AS", "")
+        ALLOW_L3VNI_NO_VLAN     = dictObj.get("ALLOW_L3VNI_NO_VLAN", "false")
+        UNDERLAY_IS_V6_TMPLT_VAR = dictObj.get("UNDERLAY_IS_V6", "false")
+        UNDERLAY_IS_V6 = UNDERLAY_IS_V6_TMPLT_VAR == "true"
+
+        Wrapper.print("%s - FAB [%s] Start" % (funcName, FABRIC_NAME))
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        errorMsg = ""
+        handle_replication_mode_change = False
+        evpn_turned_off = False
+        rolesWithoutTenantDhcpCfg = ["spine", "border spine", "border gateway spine", "super spine","border super spine","border gateway super spine"]
+        overlayConfigPresent = Util.exe(Helper.isOverlayExist(FABRIC_NAME))
+        isAnySSpInTopo = topologyDataObj.check(TopologyInfoType.IS_ANY_SUPER_SPINE_ROLE_PRESENT)
+        isAnyNonSSBorderInTopo = topologyDataObj.check(TopologyInfoType.IS_ANY_BORDER_SPINE_ROLE_PRESENT)
+
+        if isEasyFabricInbandPoapEnabled(dictObj) == "true":
+            # ensure that if a spine switch is a seed.. all the other spine switches must be seeds
+            eSpines = topologyDataObj.get(TopologyInfoType.SPINES)
+            borderSpines = topologyDataObj.get(TopologyInfoType.BORDER_SPINES)
+            borderGwSpines = topologyDataObj.get(TopologyInfoType.BORDER_GATEWAY_SPINES)
+            superSpines = topologyDataObj.get(TopologyInfoType.SUPER_SPINES)
+            borderSuperSpines = topologyDataObj.get(TopologyInfoType.BORDER_SUPER_SPINES)
+            borderGwSuperSpines = topologyDataObj.get(TopologyInfoType.BORDER_GATEWAY_SUPER_SPINES)
+
+            spines = filter(None, set(eSpines + borderSpines + borderGwSpines + superSpines + borderSuperSpines + borderGwSuperSpines))
+
+            numSpines = len(spines)
+            nonSeedSpines = []
+            for spine in spines:
+                if not isSeedSwitch(spine):
+                    nonSeedSpines.append(spine)
+
+            numNonSeedSpines = len(nonSeedSpines)
+            Wrapper.print("%s - FAB [%s] numSpines [%d] numNonSeedSpines [%s] nonSeedSpines %s" % (funcName, FABRIC_NAME,
+                numSpines, numNonSeedSpines, nonSeedSpines))
+            if numNonSeedSpines and (numNonSeedSpines != numSpines):
+                respObj.addErrorReport(getFabErrEntity(funcName, "Inband POAP: Non Seed Spines"),
+                        "All spines must be seed switches with Inband POAP enabled! Please delete %s switches from the "
+                        "fabric, add them back as inband POAP seed switches and retry." % (",".join(nonSeedSpines)))
+                respObj.setFailureRetCode()
+
+        if UNDERLAY_IS_V6:
+            if isAnySSpInTopo and FF != "Easy_Fabric_SRv6" and FF != "Easy_Fabric_eBGP":
+                respObj.addErrorReport(getFabErrEntity(funcName, "Super Spine"),
+                                       "Super Spine roles are not supported with IPv6 Underlay")
+                respObj.setFailureRetCode()
+
+            for deviceSn in devices:
+                if REPLICATION_MODE == "Multicast":
+                    if isVirtualVPCSwitch(FABRIC_NAME, deviceSn):
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn+":IPv6 Underlay Fabric Peering"),
+                            "vPC Virtual Peer Link with IPv6 Underlay and multicast replication mode is not supported", deviceSn)
+                        respObj.setFailureRetCode()
+                else:
+                    swVersionOk = Util.isSwVersionOk(deviceSn, "10.3.2")
+                    if isVirtualVPCSwitch(FABRIC_NAME, deviceSn) and not swVersionOk:
+                        hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+                        nxosImage = Util.exe(ImageManagementWrapper.getNXOSVersion(deviceSn))
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn+":IPv6 Underlay Fabric Peering"),
+                           "vPC Virtual Peer Link with IPv6 Underlay is supported from 10.3.2 onwards, switch %s has %s"%(hostName, nxosImage), deviceSn)
+                        respObj.setFailureRetCode()
+
+        if FABRIC_INTERFACE_TYPE == "unnumbered":
+            for deviceSn in devices:
+                devModel = topologyDataObj.getSwitchModel(deviceSn)
+                if (devModel.startswith("N9K-C98")):
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn+":Unnumbered Fabric Interface"),
+                                           "N9K-C9800 does not support IP Unnumbered", deviceSn)
+                    respObj.setFailureRetCode()
+
+        if ALLOW_L3VNI_NO_VLAN == "false" and (FF == "Easy_Fabric" or (FF == "Easy_Fabric_eBGP" and ENABLE_EVPN == "true")):
+            for deviceSn in devices:
+                devModel = topologyDataObj.getSwitchModel(deviceSn)
+                if (devModel.startswith("N9K-C98")):
+                    switchRole = topologyDataObj.getSwitchRole(deviceSn)
+                    if switchRole == "spine" or switchRole == "super spine":
+                        continue
+
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                                           "'Allow L3VNI w/o VLAN' in fabric settings cannot be false with the presence of N9K-C9800 VTEP", deviceSn)
+                    respObj.setFailureRetCode()
+
+        if isAnySSpInTopo: 
+            if isAnyNonSSBorderInTopo:
+                respObj.addErrorReport(getFabErrEntity(funcName, "Fabric with Super Spine devices"),
+                                       "Border Spine or Border Gateway Spine roles switches are not allowed "
+                                       "when any Super Spine role is present in the Fabric, please remove these devices from fabric to perform Recalculate Config")
+                respObj.setFailureRetCode()
+        
+            if FF != "Easy_Fabric" and FF != "External" and FF != "Easy_Fabric_SRv6" and FF != "Easy_Fabric_eBGP" and FF != "Easy_Fabric_IOS_XE":
+                respObj.addErrorReport(getFabErrEntity(funcName, FABRIC_NAME+":"+FF),
+                                       "Super Spine roles are supported only in Easy Fabric, Easy Fabric eBGP, Easy Fabric IOS XE and External Fabric")
+                respObj.setFailureRetCode()
+
+            if FF == "Easy_Fabric_eBGP":
+                if SUPER_SPINE_BGP_AS == "":
+                    respObj.addErrorReport(getFabErrEntity(funcName, "Fabric with Super Spine devices"),
+                        "Super Spine BGP AS needs to be provided with the presence of any super spine.")
+                    respObj.setFailureRetCode()
+
+        try:
+            parentFabric = Util.exe(FabricWrapper.getParentFabricName(FABRIC_NAME))
+            msdFabSettings = Util.exe(FabricWrapper.get(parentFabric)).getNvPairs()
+            msdUnderlayV6 = msdFabSettings["VXLAN_UNDERLAY_IS_V6"] == "true"
+            if UNDERLAY_IS_V6 != msdUnderlayV6:
+                # must be a change in child fabric
+                if UNDERLAY_IS_V6:
+                    respObj.addErrorReport(getFabErrEntity(funcName, FABRIC_NAME),
+                                       "Cannot change Underlay from IPv4 to IPv6 while parent fabric %s has IPv4 VXLAN underlay"%parentFabric)
+                else:
+                    respObj.addErrorReport(getFabErrEntity(funcName, FABRIC_NAME),
+                                       "Cannot change Underlay from IPv6 to IPv4 while parent fabric %s has IPv6 VXLAN underlay"%parentFabric)
+                respObj.setFailureRetCode()
+
+            if UNDERLAY_IS_V6 and REPLICATION_MODE != "Multicast":
+                respObj.addErrorReport(getFabErrEntity(funcName, FABRIC_NAME),
+                                       "VXLAN fabric %s is child fabric of MSD fabric %s, thus cannot have ingress replication mode"% (FABRIC_NAME, parentFabric))
+                respObj.setFailureRetCode()
+        except:
+            pass
+
+        if respObj.isRetCodeFailure():
+            return respObj
+
+        for deviceSn in devices:
+            switchRole = topologyDataObj.get(TopologyInfoType.GET_SWITCH_ROLE, deviceSn)
+            hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+
+            if REPLICATION_MODE == "Ingress":
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_multicast_11_1"))
+                ptiList += Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_asm_v6"))
+                if ptiList:
+                    if overlayConfigPresent and ENABLE_EVPN == "true":
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "Cannot change Fabric Replication Mode from Multicast to Ingress with existing overlay definitions.", deviceSn)
+                        respObj.setFailureRetCode()
+                    else:
+                        handle_replication_mode_change = True
+            elif REPLICATION_MODE == "Multicast":
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", "ingress_rep_simulated"))
+                if ptiList:
+                    if overlayConfigPresent and ENABLE_EVPN == "true":
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "Cannot change Fabric Replication Mode from Ingress to Multicast with existing overlay definitions.", deviceSn)
+                        respObj.setFailureRetCode()
+                    else:
+                        handle_replication_mode_change = True
+
+            intfName = "loopback" + BGP_LB_ID
+            if UNDERLAY_IS_V6:
+                if LINK_STATE_ROUTING != "ebgp":
+                    lbPtiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", intfName, intfName, "loopback_interface"))
+                    lbTagPtiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", intfName, intfName, "loopback_interface_with_tag"))
+                    if lbPtiList or lbTagPtiList:
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "Cannot change Underlay from IPv4 to IPv6 with existing IPv4 config", deviceSn)
+                        respObj.setFailureRetCode()
+            else:
+                lbPtiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", intfName, intfName, "v6_loopback_interface"))
+                lbTagPtiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", intfName, intfName, "v6_loopback_interface_with_tag"))
+                if lbPtiList or lbTagPtiList:
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                        "Cannot change Underlay from IPv6 to IPv4 with existing IPv6 config", deviceSn)
+                    respObj.setFailureRetCode()
+            
+            if not UNDERLAY_IS_V6 and MPLS_HANDOFF == "false":
+                srchOpt = CtrlPolicySearch()
+                srchOpt.setSerialNumber(deviceSn)
+                srchOpt.setTemplateContentType("PYTHON")
+                srchOpt.setTemplateName("ext_int_fabric_mpls_uplink")
+                underlayPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                srchOpt.setTemplateName("ext_int_fabric_mpls_uplink_po")
+                underlayPoPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                srchOpt.setTemplateContentType("TEMPLATE_CLI")
+                srchOpt.setTemplateName("vxlan_mpls_overlay")
+                overlayPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                if underlayPtiList or underlayPoPtiList or overlayPtiList:
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                        "Cannot disable MPLS Handoff when VXLAN-to-MPLS IFCs are present on the device", deviceSn)
+                    respObj.setFailureRetCode()
+
+            if overlayConfigPresent:
+                """
+                # commented out till an issue with improper IFC cleanup (CSCvo40702) is fixed
+                if switchRole not in rolesWithoutTenantDhcpCfg:
+                    # disallow tenant DHCP setting change with overlays present
+                    reportError = False
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "feature_dhcp"))
+                    Wrapper.print("validateFabricSetting: [%s] Role [%s] DHCP, # PTIs/ENABLE_TENANT_DHCP = [%d/%s]" %
+                        (deviceSn, hostName, switchRole, len(ptiList), ENABLE_TENANT_DHCP))
+                    if ptiList:
+                        if ENABLE_TENANT_DHCP != "true":
+                            reportError = True
+                    else:
+                        if ENABLE_TENANT_DHCP == "true":
+                            reportError = True
+                    if reportError:
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "[%s:%s] - Cannot change Tenant DHCP settings when Overlay config is present" % (deviceSn, hostName))
+                        respObj.setFailureRetCode()
+                """
+            if FABRIC_INTERFACE_TYPE == "unnumbered":
+                template_name = "int_fabric_num_11_1"
+            else:
+                template_name = "int_fabric_unnum_11_1"
+
+            srchOpt = CtrlPolicySearch()
+            srchOpt.setSerialNumber(deviceSn)
+            srchOpt.setTemplateName(template_name)
+            srchOpt.setTemplateContentType("PYTHON")
+            ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+            if ptiList:
+                respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                    "Cannot change Fabric Interface Type to %s with existing %s config." % (FABRIC_INTERFACE_TYPE,
+                        "p2p" if template_name == "int_fabric_num_11_1" else "unnumbered"), deviceSn)
+                respObj.setFailureRetCode()
+
+            if ENABLE_EVPN != "true" and FF == "Easy_Fabric_eBGP":
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_feature_leaf_evpn"))
+                if ptiList:
+                    evpn_turned_off = True
+
+        if not respObj.isRetCodeSuccess():
+            respObj.addErrorReport(getFabErrEntity(funcName),
+                "Inconsistency between Fabric setting and existing device configuration. All errors should be resolved prior to Recalculate Config.")
+            return respObj
+
+        if evpn_turned_off:
+            Wrapper.print("++++ %s, evpn turned off")
+            # use the subsequent logic to clean up multicast polices and loopbacks
+            handle_replication_mode_change = True
+            REPLICATION_MODE = "Ingress"
+
+        if handle_replication_mode_change:
+            if REPLICATION_MODE == "Multicast":
+                # IR->Mcast
+                for deviceSn in devices:
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", "ingress_rep_simulated"))
+                    for pti in ptiList:
+                        Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+            else:
+                # Mcast->IR
+                # keep "feature_pim" as removing it would cause failure on "no ip pim sparse" under interface
+                for deviceSn in devices:
+                    if not UNDERLAY_IS_V6:
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_multicast_11_1"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_multicast_11_1"))
+
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_asm_11_1"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_asm_11_1"))
+
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_bidir_11_1"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_bidir_11_1"))
+                        # Clean up Bidir PTIs created by brownfield
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", "base_pim_bidir_11_1"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "", "base_pim_bidir_11_1"))
+
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "anycast_rp"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "anycast_rp"))
+                    else:
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_asm_v6"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "base_pim_asm_v6"))
+
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "anycast_rp_v6"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "anycast_rp_v6"))
+
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "tcam_preconfig_vxlanv6_pim"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "tcam_preconfig_vxlanv6_pim"))
+
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", "rp_state"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.delete(deviceSn, "SWITCH", "SWITCH", "", "rp_state"))
+
+                    rpLbId = ""
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", "rp_lb_id"))
+                    if ptiList:
+                        rpLbId = ptiList[0].nvPairs.get("id")
+                        Util.exe(PTIWrapper.delete(deviceSn, "SWITCH", "SWITCH", "", "rp_lb_id"))
+                        rpLbIntfName = "loopback" + rpLbId
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", rpLbIntfName, "UNDERLAY"))
+                        for pti in ptiList:
+                            Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+                        # Clean up Bidir PTIs created by brownfield
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", rpLbIntfName, ""))
+                        for pti in ptiList:
+                            Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+
+                    for id in range(1,5):
+                        rpLbId = ""
+                        templateName = "phantom_rp_lb_id" + str(id)
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", templateName))
+                        if ptiList:
+                            rpLbId = ptiList[0].nvPairs.get("id")
+                            Util.exe(PTIWrapper.delete(deviceSn, "SWITCH", "SWITCH", "", templateName))
+                            rpLbIntfName = "loopback" + rpLbId
+                            ptiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", rpLbIntfName, "UNDERLAY"))
+                            for pti in ptiList:
+                                Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+                            # Clean up Bidir PTIs created by brownfield
+                            ptiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", rpLbIntfName, ""))
+                            for pti in ptiList:
+                                Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+
+        if FF == "Easy_Fabric_IPFM":
+            for deviceSn in devices:
+                # Change of NBM mode after a device is added is not allowed in NDFC 12.1(2)
+                # Leave the below code in case PMN can support NBM mode change in future releases
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "nbm_mode"))
+                if ptiList:
+                    mode = ptiList[0].nvPairs.get("MODE")
+                    if ((mode == "pim-active" and ENABLE_NBM_PASSIVE == "true") or
+                        (mode == "pim-passive" and ENABLE_NBM_PASSIVE == "false")):
+                        # There is a change of NBM mode, update all fabric interfaces to add/delete
+                        # "pim passive" accordingly
+                        srchOpt = CtrlPolicySearch()
+                        srchOpt.setSerialNumber(deviceSn)
+                        srchOpt.setTemplateName("int_ipfm_fabric_num")
+                        ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                        for pti in ptiList:
+                            nvPairs = copy.deepcopy(pti.getNvPairs())
+                            Util.exe(PTIWrapper.updateInstance(pti.getPolicyId(), nvPairs, True))
+                
+                if ENABLE_NBM_PASSIVE == "true" or (ENABLE_NBM_PASSIVE == "false" and ENABLE_ASM == "false"):
+                    # keep "feature_pim" as removing it would cause failure on "no ip pim sparse" under interface
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_pim_asm"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_pim_asm"))
+                    else:
+                        # No IPFM multicast is configured on the device, move onto the next device
+                        continue
+    
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_route_map"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_route_map"))
+    
+                    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "pim_spt_threshold"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "pim_spt_threshold"))
+
+                    if topologyDataObj.getSwitchRole(deviceSn) == "spine":
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_msdp_origid"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_msdp_origid"))
+        
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_msdp_peer"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "ipfm_msdp_peer"))
+
+                        rpLbId = ""
+                        ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "", "rp_lb_id"))
+                        if ptiList:
+                            rpLbId = ptiList[0].nvPairs.get("id")
+                            Util.exe(PTIWrapper.delete(deviceSn, "SWITCH", "SWITCH", "", "rp_lb_id"))
+                            rpLbIntfName = "loopback" + rpLbId
+                            ptiList = Util.exe(PTIWrapper.get(deviceSn, "INTERFACE", rpLbIntfName, "UNDERLAY"))
+                            for pti in ptiList:
+                                Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+
+                    # Update all routed interfaces to delete pim config from the interface
+                    srchOpt = CtrlPolicySearch()
+                    srchOpt.setSerialNumber(deviceSn)
+                    srchOpt.setTemplateName("int_ipfm_l3_port")
+                    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                    srchOpt.setTemplateName("int_ipfm_vlan")
+                    ptiList += Util.exe(PTIWrapper.getPTIs(srchOpt))
+                    for pti in ptiList:
+                        nvPairs = copy.deepcopy(pti.getNvPairs())
+                        Util.exe(PTIWrapper.updateInstance(pti.getPolicyId(), nvPairs, True))
+    except Exception as e:
+        Wrapper.print("%s - FAB [%s] Exception [%s]" % (funcName, FABRIC_NAME, e))
+        if isinstance(e, respObjError):
+            Util.processRespObj(respObj, e.value)
+        else:
+            Util.handleException(("Unexpected error validating fabric settings. Please retry and if "
+                "issue persists, contact Cisco TAC"), e, respObj)
+    finally:
+        Wrapper.print("%s - FAB [%s] Finish. Success = [%r]" % (funcName, FABRIC_NAME, respObj.isRetCodeSuccess()))
+        return respObj
+
+def validateManageabilityTabSettings(dictObj):
+
+    DNS_SERVER_IP_LIST      = dictObj["DNS_SERVER_IP_LIST"]
+    DNS_SERVER_VRF          = dictObj["DNS_SERVER_VRF"]
+    NTP_SERVER_IP_LIST      = dictObj["NTP_SERVER_IP_LIST"]
+    NTP_SERVER_VRF          = dictObj["NTP_SERVER_VRF"]
+    SYSLOG_SERVER_IP_LIST   = dictObj["SYSLOG_SERVER_IP_LIST"]
+    SYSLOG_SEV              = dictObj["SYSLOG_SEV"]
+    SYSLOG_SERVER_VRF       = dictObj["SYSLOG_SERVER_VRF"]
+
+    Wrapper.print("======== validateManageabilityTabSettings ==========")
+    respObj = WrappersResp.getRespObj()
+    respObj.setSuccessRetCode()
+
+    # Validate DNS Server input
+    if DNS_SERVER_IP_LIST:
+        DNSipList   =   []
+        DNSvrfList  =   []
+
+        # Skip whitespace and split string by comma
+        DNSipList = [eachIP.strip() for eachIP in DNS_SERVER_IP_LIST.split(',')]
+        DNSvrfList = [eachvrf.strip() for eachvrf in DNS_SERVER_VRF.split(',')]
+       
+        inputStatusDNS = getComparisonStatusIP_VRFS(DNSipList, DNSvrfList)
+
+        if(inputStatusDNS == None or inputStatusDNS == -1 or len(DNSvrfList) < 1 ):
+            Wrapper.print("DNS Error")
+            ipLenDNS = str(len(DNSipList))
+            vrfLenDNS = str(len(DNSvrfList))
+            respObj.addErrorReport("DNS Server Settings",
+                "Incorrect number of DNS Server IPs [Count = %s] and DNS Server VRFs [Count = %s] . Please maintain many to one or one to one mapping of DNS Server IPs and DNS Server VRFs respectively." % (ipLenDNS, vrfLenDNS))
+            respObj.setFailureRetCode()
+
+        if inputStatusDNS == 1:
+            ipLenDNS = str(len(DNSipList))
+            DNSVrf = DNSvrfList[0]
+             # Maximum number of Ip addresses per vrf is 6
+            if len(DNSipList) > 6:
+                respObj.addErrorReport("DNS Server Settings",
+                    "Incorrect number of DNS Server IPs [Count = %s] for vrf : %s. Maximum number of DNS Server IPs per vrf is 6." % (ipLenDNS, DNSVrf))
+                respObj.setFailureRetCode()
+        else:
+            # Create a dictionary to account for ips under same vrfs
+            DNS_IPdict = {}
+            for ip, vrf in zip(DNSipList, DNSvrfList):
+                Wrapper.print(str(ip) + " " + str(vrf))
+                if vrf in DNS_IPdict:
+                    dnsList = DNS_IPdict.get(vrf)
+                    dnsList.append(ip)
+                    # Maximum number of Ip addresses per vrf is 6
+                    if len(dnsList) > 6:
+                        ipLenDNS = str(len(dnsList))
+                        respObj.addErrorReport("DNS Server Settings",
+                            "Incorrect number of DNS Server IPs [Count = %s] for vrf : %s. Maximum number of DNS Server IPs per vrf is 6." % (ipLenDNS, vrf))
+                        respObj.setFailureRetCode()
+                else:
+                    dnsList = []
+                    dnsList.append(ip)
+                    DNS_IPdict[vrf] = dnsList
+                    Wrapper.print(str(DNS_IPdict))
+                
+    # Validate NTP Server input
+    if NTP_SERVER_IP_LIST:
+        NTPipList   =   []
+        NTPvrfList  =   [] 
+
+        # Skip whitespace and split string by comma
+        NTPipList = [eachIP.strip() for eachIP in NTP_SERVER_IP_LIST.split(',')]
+        NTPvrfList = [eachvrf.strip() for eachvrf in NTP_SERVER_VRF.split(',')]
+        
+        inputStatusNTP = getComparisonStatusIP_VRFS(NTPipList, NTPvrfList)
+        Wrapper.print(str(inputStatusNTP))
+
+        if(inputStatusNTP == None or inputStatusNTP == -1 or len(NTPvrfList) < 1 ):
+            Wrapper.print("NTP Error")
+            ipLenNTP = str(len(NTPipList))
+            vrfLenNTP = str(len(NTPvrfList))
+            respObj.addErrorReport("NTP Server Settings",
+                "Incorrect number of NTP Server IPs [Count = %s] and NTP Server VRFs [Count = %s] . Please maintain many to one or one to one mapping of NTP Server IPs and NTP Server VRFs respectively." % (ipLenNTP, vrfLenNTP))
+            respObj.setFailureRetCode()
+        
+    # Validate SYSLOG Server input
+    
+    if SYSLOG_SERVER_IP_LIST:
+        SYSipList   =   []
+        SYSvrfList  =   []
+        SYSsevList  =   []
+        # Skip whitespace and split string by comma
+        SYSipList  = [eachIP.strip() for eachIP in SYSLOG_SERVER_IP_LIST.split(',')]
+        SYSvrfList = validateSyslogVrf(SYSLOG_SERVER_VRF, respObj)
+        SYSsevList = validateSyslogSeverity(SYSLOG_SEV, respObj)
+        if respObj.isRetCodeFailure():
+            return respObj
+
+        # Check for valid number of IP , vrfs and Severity
+        inputStatusSYSVrf = getComparisonStatusIP_VRFS(SYSipList, SYSvrfList)
+        inputStatusSYSSev = getComparisonStatusIP_SEV(SYSipList,SYSsevList)
+        
+        if(inputStatusSYSVrf == None or inputStatusSYSVrf == -1 or len(SYSvrfList) < 1 or inputStatusSYSSev == None or inputStatusSYSSev == -1 or len(SYSvrfList) < 1):
+            Wrapper.print("SYSLOG Error")
+            ipLenSYS = str(len(SYSipList))
+            vrfLenSYS = str(len(SYSvrfList))
+            sevLenSYS = str(len(SYSsevList))
+            respObj.addErrorReport("SYSLOG Server Settings",
+                "Incorrect number of Syslog Server IPs [Count = %s], Syslog Server VRFs [Count = %s], Syslog Severity [Count = %s] . Please maintain many to one or one to one mapping of Syslog Server IPs and Syslog Server VRFs and Syslog Severity respectively." % (ipLenSYS, vrfLenSYS, sevLenSYS))
+            respObj.setFailureRetCode()
+
+        # Maximum number of syslog servers that can be configured is 8
+        if len(SYSipList) > 8:
+            ipLenSYS = str(len(SYSipList))
+            respObj.addErrorReport("SYSLOG Server Settings",
+                "Incorrect number of Syslog Server IPs [Count = %s]. Maximum number of Syslog servers IPs that can be configured is 8." % (ipLenSYS))
+            respObj.setFailureRetCode()
+
+        uniqueSysIps = []
+        duplicateSysIps = []
+        for sysIp in SYSipList:
+            if sysIp not in uniqueSysIps:
+                uniqueSysIps.append(sysIp)
+            else:
+                if sysIp not in duplicateSysIps:
+                    duplicateSysIps.append(sysIp)
+        if len(duplicateSysIps) > 0:
+            respObj.addErrorReport("SYSLOG Server Settings",
+                "Found duplicate IPs in the 'Syslog Server IPs' list, please remove duplicate IPs %s from the list." % duplicateSysIps)
+            respObj.setFailureRetCode()
+
+    Wrapper.print("====== end of validateManageabilityTabSettings =======")
+    return respObj
+
+def manageabilityConfigGen(dictObj):
+    try:
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        devices = dictObj["DEVICES"]
+        for deviceSn in devices:
+            dictObj.update({"DEVICE_SN": deviceSn}) 
+            Util.exe(manageabilityConfigGenDevice(dictObj))
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def manageabilityConfigGenDevice(dictObj):
+    try:
+        DNS_SERVER_IP_LIST      = dictObj["DNS_SERVER_IP_LIST"]
+        DNS_SERVER_VRF          = dictObj["DNS_SERVER_VRF"]
+        NTP_SERVER_IP_LIST      = dictObj["NTP_SERVER_IP_LIST"]
+        NTP_SERVER_VRF          = dictObj["NTP_SERVER_VRF"]
+        SYSLOG_SERVER_IP_LIST   = dictObj["SYSLOG_SERVER_IP_LIST"]
+        SYSLOG_SEV              = dictObj["SYSLOG_SEV"]
+        SYSLOG_SERVER_VRF       = dictObj["SYSLOG_SERVER_VRF"]
+        AAA_SERVER_CONF         = dictObj["AAA_SERVER_CONF"]
+        deviceSn                = dictObj["DEVICE_SN"]
+
+        Wrapper.print("======== manageabilityConfigGenDevice for %s ==========" % deviceSn)
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        CONFIG_PRIORITY_DNS_VRF = 911   # need to higher than other PTI's in vrf context so that dns_vrf will be executed last
+
+         # Configure 
+        Util.exe(configureDNS(respObj,deviceSn,DNS_SERVER_IP_LIST,DNS_SERVER_VRF,CONFIG_PRIORITY_DNS_VRF))
+        Util.exe(configureNTP(respObj,deviceSn,NTP_SERVER_IP_LIST, NTP_SERVER_VRF))
+        Util.exe(configureSYSLOG(respObj,deviceSn,SYSLOG_SERVER_IP_LIST, SYSLOG_SEV, SYSLOG_SERVER_VRF))
+        Util.exe(configureAAA(dictObj))
+        Util.exe(configureBanner(dictObj))
+
+        Wrapper.print("====== end of manageabilityConfigGenDevice =======")
+
+        return respObj
+    except respObjError as e:
+        return e.value
+
+# Validation for 1:1 or 1 : many mapping of IP addreses , vrfs 
+def getComparisonStatusIP_VRFS(iPList, vrfList):
+     # Null or empty
+    if((iPList == '' and vrfList == '') or (len(vrfList)==0 and len(iPList)==0)):
+        return 0
+    if(iPList == "" or vrfList == "" or len(vrfList)==0 or len(iPList)==0):
+        return -1;
+    # valid conditions
+    if (len(vrfList) == 1):
+        return 1;
+    if (len(vrfList) == len(iPList)):
+        return len(vrfList);
+    # All other invalid
+    return -1;
+    
+# returns the list of vrf strings entries and validate the input
+def validateSyslogVrf(vrfListString, respObj):
+    strList = [val.strip() for val in vrfListString.split(',')]
+    for val in strList:
+        # the vrf must be < 32 chars
+        if (len(val) > 32):
+            respObj.setFailureRetCode()
+            respObj.addErrorReport("INVALID_SYSLOG_VRF", "Invalid Syslog VRF [%s]. Please ensure these are < 32 characters in length." % val)
+            return None
+    return strList
+
+# returns the list of severity string entries and validate the input
+def validateSyslogSeverity(sevListString, respObj):
+    strList = [eachSev.strip() for eachSev in sevListString.split(',')]
+    for val in strList:
+        # the severity must an integer in the range 0-7
+        isInvalid = True
+        try:
+            sevInt = int(val)
+            if sevInt >= 0 and sevInt <= 7:
+                isInvalid = False
+        except:
+            pass
+        if isInvalid:
+            respObj.setFailureRetCode()
+            respObj.addErrorReport("INVALID_SYSLOG_SEVERITY", "Invalid Syslog Severity [%s]. Please ensure these are integers in the range 0-7." % val)
+            return None
+    return strList
+
+# Validation for 1:1 or 1 : many mapping of IP addreses , Severity 
+def getComparisonStatusIP_SEV(iPList, sevList):
+     # Null or empty
+    if((iPList == '' and sevList == '') or (len(sevList)==0 and len(iPList)==0)):
+        return 0
+    if(iPList == '' or sevList == '' or len(sevList)==0 or len(iPList)==0):
+        return -1;
+    # valid conditions
+    if (len(sevList) == 1):
+        return 1;
+    if (len(sevList) == len(iPList)):
+        return len(sevList);
+    # All other invalid
+    return -1;
+
+def deleteExistingPoliciesDNS(deviceSn):
+    Wrapper.print("deleteExistingPoliciesDNS: Switch [%s]" % deviceSn)
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setTemplateName("dns")
+    ptis = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("dns_one")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("dns_vrf")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("dns_vrf_one")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setSource("")
+    srchOpt.setTemplateName("dns-vrfList")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("dnsList")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    
+    for pti in ptis:
+       PTIWrapper.markDeleteInstance(pti.getPolicyId())
+
+def configureDNS(respObj,deviceSn, DNS_SERVER_IP_LIST,DNS_SERVER_VRF,CONFIG_PRIORITY_DNS_VRF):
+    
+    Wrapper.print("configureDNS: Switch [%s] DNS_SERVER_IP_LIST [%s]" % (deviceSn, DNS_SERVER_IP_LIST))
+    
+    # Search all the existing policies which needs to be deleted
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setSource("UNDERLAY")
+    srchOpt.setTemplateName("dns-vrfList")
+    ptis = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("dnsList")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+
+    if DNS_SERVER_IP_LIST == '':
+        for pti in ptis:
+            PTIWrapper.markDeleteInstance(pti.getPolicyId())
+        return respObj
+    else:
+        # first time DNS is configured in the fabric setting tab.. cleanup all old policies that could exist 
+        # pre-upgarde and/or user created ones from View/Edit policies
+        deleteExistingPoliciesDNS(deviceSn)
+    
+    DNSipList   =   []
+    DNSvrfList  =   []
+
+    # Skip whitespace and split string by comma
+    DNSipList = [eachIP.strip() for eachIP in DNS_SERVER_IP_LIST.split(',')]
+    DNSvrfList = [eachvrf.strip() for eachvrf in DNS_SERVER_VRF.split(',')]
+   
+    inputStatus = getComparisonStatusIP_VRFS(DNSipList, DNSvrfList)
+    Wrapper.print("configureDNS: inputStatus [%s]" % str(inputStatus))
+    
+    # delete the existing policies.. we will recreate them in case they do not match the earlier ones
+    for pti in ptis:
+        PTIWrapper.markDeleteInstance(pti.getPolicyId())
+    
+    if(inputStatus == 1):
+        eachIP = ""
+        eachVrf = DNSvrfList[0]
+        for ip in DNSipList:
+            eachIP  += ip +' '
+            # switch supports 6 DNS IP address to be configured at once
+        confDNS(deviceSn,eachIP,eachVrf,CONFIG_PRIORITY_DNS_VRF)
+    else:    
+        # Create a dictionary to account for ips under same vrfs
+        DNS_IPdict = {}
+        for ip, vrf in zip(DNSipList, DNSvrfList):
+            Wrapper.print(str(ip) + " " + str(vrf))
+            if vrf in DNS_IPdict:
+                dnsList = DNS_IPdict.get(vrf)
+                dnsList.append(ip)
+            else:
+                dnsList = []
+                dnsList.append(ip)
+                DNS_IPdict[vrf] = dnsList
+                Wrapper.print(str(DNS_IPdict))
+        
+        for vrf,ipList in DNS_IPdict.items():
+            eachIP = ""
+            eachVrf = vrf
+            for ip in ipList:
+                eachIP  += ip +' '
+                # switch supports 6 DNS IP address to be configured at once
+            confDNS(deviceSn,eachIP,eachVrf,CONFIG_PRIORITY_DNS_VRF)
+            
+    return respObj   
+          
+def confDNS(deviceSn,eachIP, eachVrf,CONFIG_PRIORITY_DNS_VRF):
+    Wrapper.print("confDNS")
+    Wrapper.print("IP: " +eachIP + " " + " vrf: " + eachVrf)
+    eachIP = eachIP.strip(' ')
+    if eachVrf == "default":
+        Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                          ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP,
+                                          "dnsList",
+                                          {"NAME_SERVER_ADDRESSLIST":eachIP}))
+    else:
+        Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                          CONFIG_PRIORITY_DNS_VRF,
+                                          "dns-vrfList",
+                                          {"NAME_SERVER_VRF":eachVrf, "NAME_SERVER_ADDRESSLIST":eachIP}))
+
+def configureNTP(respObj,deviceSn,NTP_SERVER_IP_LIST, NTP_SERVER_VRF):
+    Wrapper.print("configureNTP: Switch [%s] NTP_SERVER_IP_LIST [%s]" % (deviceSn, NTP_SERVER_IP_LIST))
+    
+    if NTP_SERVER_IP_LIST == '' :
+        cleanUpPti(deviceSn, "ntp_server", "UNDERLAY")
+        return respObj
+    
+    NTPipList   =   []
+    NTPvrfList  =   [] 
+    
+    # Skip whitespace and split string by comma
+    NTPipList = [eachIP.strip() for eachIP in NTP_SERVER_IP_LIST.split(',')]
+    NTPvrfList = [eachvrf.strip() for eachvrf in NTP_SERVER_VRF.split(',')]
+
+    inputStatus = getComparisonStatusIP_VRFS(NTPipList, NTPvrfList)
+    Wrapper.print("configureNTP: inputStatus [%s]" % str(inputStatus))
+    
+    # Search all the existing policies which needs to be deleted
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setTemplateName("ntp_server")
+    ptis = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    for pti in ptis:
+        PTIWrapper.markDeleteInstance(pti.getPolicyId())
+        
+    if(inputStatus == 1):
+        for ip in NTPipList:
+            eachIP  = ip
+            eachVrf = NTPvrfList[0]
+            confNTP(deviceSn,eachIP,eachVrf)
+    else:
+        for ip, vrf in zip(NTPipList, NTPvrfList):
+            eachIP  = ip
+            eachVrf = vrf
+            confNTP(deviceSn,eachIP,eachVrf)
+    return respObj
+
+def confNTP(deviceSn,eachIP, eachVrf):
+    Util.exe(PTIWrapper.create(deviceSn,"SWITCH", "SWITCH", "UNDERLAY",
+                                           ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP,
+                                           "ntp_server",
+                                           {"NTP_SERVER":eachIP, "NTP_SERVER_VRF":eachVrf}))
+    
+def configureSYSLOG(respObj,deviceSn,SYSLOG_SERVER_IP_LIST, SYSLOG_SEV, SYSLOG_SERVER_VRF):
+    Wrapper.print("configureSYSLOG: Switch [%s] SYSLOG_SERVER_IP_LIST [%s]" % (deviceSn, SYSLOG_SERVER_IP_LIST))
+
+    if SYSLOG_SERVER_IP_LIST == '':
+        cleanUpPti(deviceSn, "syslog_server_vrf", "UNDERLAY")
+        cleanUpPti(deviceSn, "syslog_server", "UNDERLAY")
+        cleanUpPti(deviceSn, "syslog_server_sev", "UNDERLAY")
+        cleanUpPti(deviceSn, "syslog_server_vrf_no_sev", "UNDERLAY")
+        return respObj
+     
+    SYSipList   =   []
+    SYSvrfList  =   []
+    SYSsevList  =   []
+    
+    # Skip whitespace and split string by comma
+    SYSipList  = [eachIP.strip() for eachIP in SYSLOG_SERVER_IP_LIST.split(',')]
+    SYSvrfList = validateSyslogVrf(SYSLOG_SERVER_VRF, respObj)
+    SYSsevList = validateSyslogSeverity(SYSLOG_SEV, respObj)
+    if respObj.isRetCodeFailure():
+        return respObj
+
+    # Check for valid number of IP , vrfs and Severity
+    inputStatusVrf = getComparisonStatusIP_VRFS(SYSipList, SYSvrfList)
+    inputStatusSev = getComparisonStatusIP_SEV(SYSipList,SYSsevList)
+    
+    # Search all the existing policies which needs to be deleted
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setTemplateName("syslog_server_vrf")
+    ptis = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("syslog_server")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("syslog_server_sev")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("syslog_server_vrf_no_sev")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    # delete the existing policies.. we will recreate them in case they do not match the earlier ones
+    for pti in ptis:
+        PTIWrapper.markDeleteInstance(pti.getPolicyId())
+    
+    # Single Vrf and Single Severity
+    if(inputStatusVrf == 1 and inputStatusSev == 1 ):
+        for ip in SYSipList:
+            eachIP  = ip
+            eachVrf = SYSvrfList[0]
+            eachSev = SYSsevList[0]
+            confSYSLOG(deviceSn,eachIP,eachVrf, eachSev)
+        # Single Vrf
+    elif inputStatusVrf == 1 :
+        for ip,sev in zip(SYSipList,SYSsevList):
+            eachIP  = ip
+            eachVrf = SYSvrfList[0]
+            eachSev = sev
+            confSYSLOG(deviceSn,eachIP,eachVrf, eachSev)
+        # Single Severity
+    elif inputStatusSev == 1:
+        for ip,vrf in zip(SYSipList,SYSvrfList):
+            eachIP  = ip
+            eachVrf = vrf
+            eachSev = SYSsevList[0]
+            confSYSLOG(deviceSn,eachIP,eachVrf, eachSev)
+    else:
+        for ip, vrf,sev in zip(SYSipList, SYSvrfList,SYSsevList):
+            eachIP  = ip
+            eachVrf = vrf
+            eachSev = sev
+            confSYSLOG(deviceSn,eachIP,eachVrf, eachSev)
+
+    return respObj
+            
+def confSYSLOG(deviceSn,eachIP,eachVrf, eachSev):
+    if eachSev != "5":
+        if eachVrf.lower() != "default":
+            Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                       1101, # need to be higher than topdown vrf priority
+                                       "syslog_server_vrf",
+                                       {"IP":eachIP, "SEVERITY":eachSev, "VRF":eachVrf}))
+        else:
+            Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                       1101, # need to be higher than topdown vrf priority
+                                       "syslog_server_sev",
+                                       {"IP":eachIP, "SEVERITY":eachSev}))
+        return
+
+    # syslog severity is 5
+    # "show run" does not show severity 5 starting 10.2(4)/10.3(2) or if server vrf is default
+    if eachVrf.lower() == "default":
+        Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                   1101, # need to be higher than topdown vrf priority
+                                   "syslog_server",
+                                   {"IP":eachIP}))
+        return
+
+    sevInShowRun = True
+    nxosVersion = Util.exe(ImageManagementWrapper.getNXOSVersion(deviceSn))
+    if nxosVersion.startswith("10.2") and Util.isSupportedN9kImage(nxosVersion, "10.2(4)"):
+        sevInShowRun = False
+    elif Util.isSupportedN9kImage(nxosVersion, "10.3(2)"):
+        sevInShowRun = False
+    if sevInShowRun:
+        Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                   1101, # need to be higher than topdown vrf priority
+                                   "syslog_server_vrf",
+                                   {"IP":eachIP, "SEVERITY":eachSev, "VRF":eachVrf}))
+    else:
+        Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                   1101, # need to be higher than topdown vrf priority
+                                   "syslog_server_vrf_no_sev",
+                                   {"IP":eachIP, "VRF":eachVrf}))
+
+def deleteExistingPoliciesAAA(deviceSn):
+    Wrapper.print("deleteExistingPoliciesAAA: Switch [%s]" % deviceSn)
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setTemplateName("aaa_radius_key")
+    ptis = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_radius")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_radius_use_vrf")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("base_aaa")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("feature_tacacs")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_tacacs_key")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_tacacs")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_tacacs_use_vrf")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_tacacs_src_interface")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_radius_src_interface")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+    srchOpt.setTemplateName("aaa_radius_deadtime")
+    ptis += Util.exe(PTIWrapper.getPTIs(srchOpt))
+
+    for pti in ptis:
+        PTIWrapper.markDeleteInstance(pti.getPolicyId())
+
+def configureAAA(dictObj):
+
+    try:
+        respObj         = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        deviceSn        = dictObj["DEVICE_SN"]
+        AAA_SERVER_CONF = dictObj["AAA_SERVER_CONF"]
+        aaa_conf        = AAA_SERVER_CONF.strip()
+        AAA_CONF_ENC = ((AAA_SERVER_CONF.encode('ascii', 'ignore')).decode("utf-8"))
+        Wrapper.print("configureAAA: Switch [%s] AAA_SERVER_CONF [%s]" % (deviceSn, AAA_CONF_ENC))
+        
+        if not aaa_conf:
+            cleanUpAAAPtis(deviceSn, "switch_freeform", "UNDERLAY_AAA")
+            return respObj
+        
+        # Search all the existing policies which needs to be deleted
+        srchOpt = CtrlPolicySearch()
+        srchOpt.setSerialNumber(deviceSn)
+        srchOpt.setTemplateName("switch_freeform")
+        
+        ptis = Util.exe(PTIWrapper.getPTIs(srchOpt))
+        aaaPolicyId = ""
+        
+        for pti in ptis:
+            if pti.getDescription() == AAA_CONF_DESCRIPTION:
+                # existing freeform that was created from the fabric settings
+                aaaPolicyId = pti.getPolicyId()
+                Wrapper.print("configureAAA: Found AAA freeform [%s]" % aaaPolicyId)
+            elif pti.getDescription() == BROWNFIELD_AAA_CONF_DESCRIPTION:
+                # freeform created during brownfield import
+                Wrapper.print("configureAAA: Found Brownfield AAA freeform [%s]" % aaaPolicyId)
+                PTIWrapper.deleteInstance(pti.getPolicyId())
+        
+        if aaaPolicyId:
+            Util.exe(PTIWrapper.updateInstance(aaaPolicyId, {"CONF": aaa_conf}))
+        else:
+            # cleanup old AAA individual policies
+            deleteExistingPoliciesAAA(deviceSn)
+        
+            # create the new AAA freeform policy
+            Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "UNDERLAY_AAA",
+                    ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP,
+                    "switch_freeform", {"CONF": aaa_conf}, AAA_CONF_DESCRIPTION))
+        return respObj    
+        
+    except respObjError as e:
+        return e.value
+
+def configureBanner(dictObj):
+    try:
+        respObj         = WrappersResp.getRespObj()
+        deviceSn        = dictObj["DEVICE_SN"]
+
+        if "BANNER" in dictObj:
+            BANNER = dictObj["BANNER"]
+            if BANNER.strip():
+                BANNER = BANNER.strip()
+                Util.exe(PTIWrapper.createOrUpdate(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                    ConfigPriority.CONFIG_PRIO_UNDERLAY_MIDDLE, "banner",
+                                    {"TYPE": "motd", "BANNER": BANNER[1:-1], "BANNERDELIMITER": BANNER[0]}))
+            else:
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "banner"))
+                if ptiList:
+                    PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "banner")
+
+        respObj.setSuccessRetCode()
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def cleanUpPti(deviceSn, template_name, source):
+    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", source, template_name))
+    if ptiList:
+        Util.exe(PTIWrapper.markDelete(deviceSn, "SWITCH", "SWITCH", source, template_name))
+
+def cleanUpAAAPtis(deviceSn, template_name,source):
+    Wrapper.print(str(deviceSn) + " " + str(source) + " " + str(template_name))
+    Wrapper.print("cleanUpAAAPtis for AAA")
+    ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", source, template_name))
+    for eachPti in ptiList:
+        Wrapper.print(str(eachPti.getPolicyId()))
+        try:
+            if eachPti.getDescription() == AAA_CONF_DESCRIPTION:
+                Util.exe(PTIWrapper.deleteInstance(eachPti.getPolicyId()))
+                Wrapper.print("clean up AAA configurations: " + str(eachPti.getPolicyId()))
+        except:
+            Wrapper.print("No clean needed")
+
+def capture_po_member_interface_ptis (dictObj):
+    try:
+        respObj = WrappersResp.getRespObj()
+
+        #Need to capture desc and FF of port channel member interfaces if any
+        Wrapper.print("capture_po_member_interface_ptis: %s" % dictObj)
+
+        MEMBER_INTERFACES = dictObj["MEMBER_INTERFACES"]
+        SERIAL_NUMBER = dictObj["SERIAL_NUMBER"]
+
+        memberInterfaces = None
+        if MEMBER_INTERFACES != "":
+            memberInterfaceList = Util.expand_interface_range(MEMBER_INTERFACES)
+            memberInterfaces = memberInterfaceList.split(",")
+
+        memberDescDict = {}
+        memberConfDict = {}
+        memberAdminStateDict = {}
+        if memberInterfaces != None:
+            for interface in memberInterfaces:
+                intfptiList = Util.exe(PTIWrapper.getPTIs(SERIAL_NUMBER, "INTERFACE", interface, "PYTHON"))
+                for intfpti in intfptiList:
+                    templateName = intfpti.getTemplateName()
+                    if templateName == "int_l3_port_channel_member" or templateName == "int_l3_port_channel_member_internal":
+                        memberDescDict[interface]  = intfpti.getNvPairs()["DESC"]
+                        memberConfDict[interface]  = intfpti.getNvPairs()["CONF"]
+                        memberAdminStateDict[interface]  = intfpti.getNvPairs()["ADMIN_STATE"]
+                        Wrapper.print("l3 po: Capturing intf %s adminState %s desc %s conf %s" %
+                                      (str(interface), str(memberAdminStateDict[interface]), str(memberDescDict[interface]), str(memberConfDict[interface])))
+                        break
+                    if (templateName == "int_access_host" or 
+                        templateName == "int_dot1q_tunnel_host" or
+                        templateName == "int_routed_host" or
+                        templateName == "int_trunk_host"):
+                        memberDescDict[interface]  = intfpti.getNvPairs()["DESC"]
+                        memberAdminStateDict[interface]  = intfpti.getNvPairs()["ADMIN_STATE"]
+                        break
+
+        respObj.setSuccessRetCode()
+        returnDict = {"memberInterfaces": memberInterfaces, "memberDescDict": memberDescDict, "memberConfDict": memberConfDict, "memberAdminStateDict": memberAdminStateDict}
+        respObj.setValue(returnDict)
+        return respObj
+    except respObjError as e:
+        return e.value
+
+
+def create_po_member_interface_ptis (dictObj):
+    try:
+        respObj = WrappersResp.getRespObj()
+
+        Wrapper.print("create_po_member_interface_ptis: %s" % dictObj)
+        SERIAL_NUMBER = dictObj["SERIAL_NUMBER"]
+        IF_NAME = dictObj["IF_NAME"]
+        memberInterfaces = dictObj["memberInterfaces"]
+        memberDescDict = dictObj["memberDescDict"]
+        memberConfDict = dictObj["memberConfDict"]
+        memberAdminStateDict = dictObj["memberAdminStateDict"]
+        pcMemTemplateName = dictObj["pcMemTemplateName"]
+
+        if memberInterfaces != None:
+            for interface in memberInterfaces:
+                #Create desc and FF PTI for port-channel member interfaces
+                memberDesc = memberDescDict.get(interface, "")
+                memberConf = memberConfDict.get(interface, "")
+                memberAdminState = memberAdminStateDict.get(interface, "true")
+
+                if memberDesc != "" or memberConf != "" or memberAdminState != "true":
+                    Wrapper.print("l3 po: Creating intf %s desc %s" % (str(interface), str(memberDescDict[interface])))
+
+                    ptiList = Util.exe(PTIWrapper.getPTIs(SERIAL_NUMBER, "INTERFACE", interface, "PYTHON"))
+                    for pti in ptiList:
+                        Wrapper.print("L3 Po member case %s %s" % (IF_NAME, interface))
+                        if pti.getTemplateName() == pcMemTemplateName:
+                            l3_po_member_nvPairs = copy.deepcopy(pti.getNvPairs())
+                            #Create new L3 Po PTI with updated nvPairs
+                            Wrapper.print("Update L3 Po member: Existing NV Pairs [%s]]" % str(l3_po_member_nvPairs))
+                            l3_po_member_nvPairs["CONF"] = memberConf
+                            l3_po_member_nvPairs["DESC"] = memberDesc
+                            l3_po_member_nvPairs["ADMIN_STATE"] = memberAdminState
+
+                            Util.exe(PTIWrapper.createOrUpdate(SERIAL_NUMBER, "INTERFACE",
+                                                       interface, IF_NAME.lower(),
+                                                       ConfigPriority.CONFIG_PRIO_INTF,
+                                                       pcMemTemplateName,
+                                                       l3_po_member_nvPairs))
+                            break
+
+        respObj.setSuccessRetCode()
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def check_po_member(dictObj):
+    try:
+        respObj = WrappersResp.getRespObj()
+        SERIAL_NUMBER = dictObj["SERIAL_NUMBER"]
+        IF_NAME = dictObj["IF_NAME"]
+
+        Wrapper.print("check port-channel membership [%s, %s]" % (SERIAL_NUMBER, IF_NAME))
+        interfaceResp = InterfaceManagerWrapper.isPortchannelMember(SERIAL_NUMBER, IF_NAME)
+        if interfaceResp.isRetCodeSuccess():
+            if interfaceResp.getValue() == True:
+                errorMsg = ("IFC cannot be created on %s as it is a member of a portchannel" % (IF_NAME))
+                Wrapper.print(errorMsg)
+                respObj.addErrorReport(("Error"), errorMsg)
+                respObj.setFailureRetCode()
+                return respObj
+        else:
+            errorMsg = ("Invalid interface wrapper response for %s %s" %(SERIAL_NUMBER, IF_NAME))
+            Wrapper.print(errorMsg)
+            respObj.addErrorReport(("Error"), errorMsg)
+            respObj.setFailureRetCode()
+            return respObj
+
+        respObj.setSuccessRetCode()
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def getNonEmptyValue(dictObj, varName, defVal):
+    val = dictObj.get(varName, defVal)
+    if (val == ""):
+        val = defVal
+    return val
+
+#
+# This API generates the following config for the specified set of devices
+#   - SNMP configuration if GEN_SNMP is present
+#   - NX-API configuration if GEN_NXAPI is present
+#
+# Input in dictObj:
+#    FABRIC_NAME    - Mandatory - String - name of the fabric
+#    SERIAL_LIST    - Mandatory - list of serial # strings to generate the config for
+#    TOPOLOGY       - Mandatory - topology object
+#    FABRIC_SETTINGS- Optional  - Current fabric settings. Will be fetched if not specified
+#    GEN_SNMP       - Optional dictionary. if present, SNMP config will be generated
+#                     {"SNMP_INFO" : snmpInfoDict}
+#    GEN_NXAPI      - Optional dictionary. if present, NX-API config will be generated
+#                     {}
+#
+def genCommonAllDeviceConfig(dictObj):
+    funcName = sys._getframe(0).f_code.co_name
+    respObj = WrappersResp.getRespObj()
+    respObj.setSuccessRetCode()
+
+    fabricName = dictObj.get("FABRIC_NAME", None)
+    serialList = dictObj.get("SERIAL_LIST", None)
+    fabricSettings = dictObj.get("FABRIC_SETTINGS", None)
+    genSnmp = dictObj.get("GEN_SNMP", None)
+    genNxapi = dictObj.get("GEN_NXAPI", None)
+    topologyDataObj = dictObj.get("TOPOLOGY", None)
+
+    generateSnmp = False
+    generateNxapi = False
+
+    try:
+        if ((serialList is None) or (topologyDataObj is None)):
+            respObj.addErrorReport(funcName + "Invalid data", ("Fabric [%s]: Invalid data encountered during SNMP "
+                "and NX-API configuration generation. Please retry and contact Cisco TAC if issue persists." % (fabricName)))
+            respObj.setFailureRetCode()
+            return respObj
+
+        if (len(serialList) == 0):
+            return respObj
+
+        if not fabricSettings:
+            fabricSettings = Util.exe(FabricWrapper.get(fabricName)).getNvPairs()
+
+        ff = fabricSettings.get("FF", "")
+
+        enableRtIntfStats = (fabricSettings.get("ENABLE_RT_INTF_STATS", "false") == "true")
+        if enableRtIntfStats:
+            intfStatsloadInterval = getNonEmptyValue(fabricSettings, "INTF_STAT_LOAD_INTERVAL", "10")
+
+        if genNxapi is not None:
+            generateNxapi = True
+            enableNxapi = fabricSettings.get("ENABLE_NXAPI", "false")
+            enableNxapiHttp = fabricSettings.get("ENABLE_NXAPI_HTTP", "false")
+            nxapiHttpsPort = getNonEmptyValue(fabricSettings, "NXAPI_HTTPS_PORT", "443")
+            nxapiHttpPort = getNonEmptyValue(fabricSettings, "NXAPI_HTTP_PORT", "80")
+            genNxapiVrf = "NXAPI_VRF" in fabricSettings
+            if genNxapiVrf:
+                nxapiVrf = fabricSettings.get("NXAPI_VRF", "management")
+    
+        if genSnmp is not None:
+            generateSnmp = True
+            snmpInfoObj = genSnmp.get("SNMP_INFO", None)
+            if snmpInfoObj is None:
+                # report an error
+                respObj.addErrorReport(funcName + "Missing SNMP Info", ("Fabric [%s] Missing SNMP information." % (fabricName)))
+                respObj.setFailureRetCode()
+                return respObj
+            snmpInfo = json.loads(snmpInfoObj)
+            Wrapper.print("%s: NDFC SNMP properties %s" % (funcName, json.dumps(snmpInfo, indent=4, sort_keys=True)))
+    
+            gblSnmpServerHost = fabricSettings.get("SNMP_SERVER_HOST_TRAP", "false")
+
+        for swSerial in serialList:
+            devModel = topologyDataObj.getSwitchModel(swSerial)
+            isNXOS = Util.isNXOSDevice(swSerial, devModel)
+
+            cleanupRtLoadInterval = True
+            if enableRtIntfStats:
+                if isNXOS:
+                    if Util.isSwVersionOk(swSerial, "10.4(3)"):
+                        # generate the intent - min version is NX-OS 10.4(3)
+                        Util.exe(PTIWrapper.createOrUpdate(swSerial, "SWITCH", "SWITCH", "UNDERLAY",
+                            ConfigPriority.CONFIG_PRIO_TOP, TEMPLATE_DME_INTF_STATS_LOAD_INTERVAL, {"INTERVAL" : intfStatsloadInterval}))
+                        cleanupRtLoadInterval = False
+
+            if cleanupRtLoadInterval:
+                ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "UNDERLAY", TEMPLATE_DME_INTF_STATS_LOAD_INTERVAL))
+                if ptiList:
+                    Util.exe(PTIWrapper.markDelete(swSerial, "SWITCH", "SWITCH", "UNDERLAY", TEMPLATE_DME_INTF_STATS_LOAD_INTERVAL))
+
+            if (gblSnmpServerHost == "true"):
+                # generate the SNMP trap host IP based on the OOB network mode 
+                # Fetch IPv4 or IPv6 address based on discovered IP of the switch
+                deviceIP = Util.exe(Helper.getSeedIp(swSerial))
+                if Util.isIpv6Addr(deviceIP):
+                    dataTrapIP = snmpInfo.get("data_trap_ipv6", None)
+                    mgmtTrapIP = snmpInfo.get("mgmt_trap_ipv6", None)
+                else:
+                    dataTrapIP = snmpInfo.get("data_trap_ip", None)
+                    mgmtTrapIP = snmpInfo.get("mgmt_trap_ip", None)
+                oobNwMode = snmpInfo.get("global.oob_network_mode")
+                trapIp = None
+                if oobNwMode == "Data":
+                    trapIp = dataTrapIP
+                else:
+                    trapIp = mgmtTrapIP
+
+                if trapIp is None:
+                    # report an error
+                    respObj.addErrorReport(funcName + "Common Config Gen",
+                               ("NDFC [%s] SNMP Trap IP Address is not configured. Please configure and retry." % (oobNwMode)))
+                    respObj.setFailureRetCode()
+                    return respObj
+
+                setSNMPV3Trap = False if snmpInfo.get("core.trap_v3enable", "true") == "false" else True
+                snmpSendPort = snmpInfo.get("global.trap_port", "2162")
+                snmpV2CommString = snmpInfo.get("global.snmp_defaultCommunity", "public")
+
+            genForNonNXOS = False
+            if ff != "Easy_Fabric_IOS_XE":
+                templateName = "snmp_server_host_trap"
+            else:
+                if dictObj.get("IS_IOS_XE") == "true":
+                    templateName = "ios_xe_snmp_server_host_trap"
+                    genForNonNXOS = True
+                else:
+                    templateName = "snmp_server_host_trap"
+
+            # generate Nx-API only for NX-OS switches
+            if generateNxapi and isNXOS:
+                if enableNxapi == "true":
+                    Util.exe(PTIWrapper.createOrUpdate(swSerial, "SWITCH", "SWITCH", "UNDERLAY",
+                                                ConfigPriority.CONFIG_PRIO_TOP, "feature_nxapi", {}))
+                    
+                    if genNxapiVrf:
+                        Util.exe(PTIWrapper.createOrUpdate(swSerial, "SWITCH", "SWITCH", "UNDERLAY",
+                                                    ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP,
+                                                    "nxapi_vrf", {"NXAPI_VRF": nxapiVrf}))
+
+                    # NXAPI is always enabled on HTTPS port, create the HTTPS policy if one has not been created.
+                    Util.exe(PTIWrapper.createOrUpdate(swSerial, "SWITCH", "SWITCH", "",
+                                                ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP,
+                                                "nxapi_https_port", {"PORT_NUMBER": nxapiHttpsPort}))
+
+                    # If NXAPI on HTTP port is enabled, create the HTTP policy if one has not been created.
+                    if enableNxapiHttp == "true":
+                        Util.exe(PTIWrapper.createOrUpdate(swSerial, "SWITCH", "SWITCH", "",
+                                                    ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP,
+                                                    "nxapi_http_port", {"PORT_NUMBER": nxapiHttpPort}))
+                    else:
+                        # NXAPI on HTTP port is disabled
+                        if devModel.startswith("N9K-") or devModel.startswith("N3K-"):
+                            # Check the NXOS release, http config can only be removed from release 9.2(1) and later releases
+                            ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "", "nxapi_http_port"))
+                            if ptiList:
+                                isSwVersion92 = Util.isSwVersionOk(swSerial, "9.2(1)")
+                                if isSwVersion92:
+                                    Util.exe(PTIWrapper.markDelete(swSerial, "SWITCH", "SWITCH", "", "nxapi_http_port"))
+                                else:
+                                    Util.exe(PTIWrapper.delete(swSerial, "SWITCH", "SWITCH", "", "nxapi_http_port"))
+                else:
+                    ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "UNDERLAY", "feature_nxapi"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.markDelete(swSerial, "SWITCH", "SWITCH", "UNDERLAY", "feature_nxapi"))
+                    if genNxapiVrf:
+                        ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "UNDERLAY", "nxapi_vrf"))
+                        if ptiList:
+                            Util.exe(PTIWrapper.markDelete(swSerial, "SWITCH", "SWITCH", "UNDERLAY", "nxapi_vrf"))
+                    ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "", "nxapi_https_port"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.markDelete(swSerial, "SWITCH", "SWITCH", "", "nxapi_https_port"))
+                    ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "", "nxapi_http_port"))
+                    if ptiList:
+                        Util.exe(PTIWrapper.markDelete(swSerial, "SWITCH", "SWITCH", "", "nxapi_http_port"))
+
+            if generateSnmp:
+                if (not isNXOS and not genForNonNXOS):
+                    continue
+                
+                if (gblSnmpServerHost == "true"):
+                    # get the switch info that has the discovery vrf and intf
+                    swInfo = Util.exe(InventoryWrapper.getSwitchInfo(fabricName, swSerial))
+                    srcVrf = swInfo.getSwitchDO().getSourceVrf()
+                    srcIntf = swInfo.getSwitchDO().getSourceInterface()
+                    Wrapper.print("%s: swSerial [%s] srcVrf [%s] srcIntf [%s]" % (funcName, swSerial, srcVrf, srcIntf))
+                    if ((srcVrf is None) or (srcVrf == "") or (srcVrf.lower() == "management")):
+                        # extra config is not needed for mgmt vrf
+                        srcVrf = ""
+                        srcIntf = ""
+
+                    if ((srcIntf is not None) and (srcIntf.lower().startswith("loopback"))):
+                        # switch expects lower case loopback intf name
+                        srcIntf = srcIntf.lower()
+
+                    if setSNMPV3Trap:
+                        commStr = Util.exe(Helper.getDiscoveryUser(swSerial))
+                        snmpVer = "3"
+                    else:
+                        commStr = snmpV2CommString
+                        snmpVer = "2c"
+
+                    Wrapper.print("%s: swSerial [%s] oobNwMode [%s] mgmtTrapIP [%s] dataTrapIP [%s] Sw [%s] trapIp [%s] "
+                        "srcVrf [%s] srcIntf [%s] SNMP ver [%s] Community String [%s] port [%s]" % (funcName, swSerial,
+                            oobNwMode, mgmtTrapIP, dataTrapIP, swSerial, trapIp, srcVrf, srcIntf, snmpVer, commStr, snmpSendPort))
+
+                createSnmpPti = False
+                foundMatch = False
+                ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "UNDERLAY", templateName))
+                if ptiList:
+                    for pti in ptiList:
+                        if pti.isDeleted():
+                            continue
+
+                        Wrapper.print("%s: Processing PTI [%s] nvpairs [%s]" % (funcName, pti.getPolicyId(), pti.getNvPairs()))
+
+                        if (gblSnmpServerHost == "false"):
+                            PTIWrapper.markDeleteInstance(pti.getPolicyId())
+                            continue
+
+                        if ((trapIp != pti.nvPairs.get("IP")) or (snmpVer != pti.nvPairs.get("VER")) or
+                            (commStr != pti.nvPairs.get("CS")) or (snmpSendPort != pti.nvPairs.get("UDP_PORT")) or
+                            (srcIntf != pti.nvPairs.get("SRC_INTF") or (srcVrf != pti.nvPairs.get("VRF")))):
+                            PTIWrapper.markDeleteInstance(pti.getPolicyId())
+                            if not foundMatch:
+                                createSnmpPti = True
+                        else:
+                            foundMatch = True
+                            createSnmpPti = False
+                else:
+                    # no PTIs exist currently
+                    createSnmpPti = True
+
+                if (gblSnmpServerHost == "true"):
+                    if not createSnmpPti and not foundMatch:
+                        # This can occur in this sequence:
+                        #  - setting is enabled with the trap host config deploy
+                        #  - disable + S & D (PTI will be mark deleted)
+                        #  - enable + S & D
+                        createSnmpPti = True
+                    if createSnmpPti:
+                        Util.exe(PTIWrapper.create(swSerial, "SWITCH", "SWITCH", "UNDERLAY",
+                                                    ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP, templateName,
+                                                    {"IP":trapIp, "VER":snmpVer, "CS":commStr, "UDP_PORT":snmpSendPort,
+                                                    "SRC_INTF" : srcIntf, "VRF" : srcVrf}))
+    except Exception as e:
+        Wrapper.print("%s - FAB [%s] Exception [%s]" % (funcName, fabricName, e))
+        if isinstance(e, respObjError):
+            Util.processRespObj(respObj, e.value)
+        else:
+            Util.handleException("Unexpected error. Please retry.", e, respObj)
+    finally:
+        Wrapper.print("%s - FAB [%s] Finish. Success = [%r]" % (funcName, fabricName, respObj.isRetCodeSuccess()))
+        return respObj
+
+#
+# Manages the SNMP trap config for a given switch
+# Input in dictObj:
+#    FABRIC_NAME    - Mandatory - name of the fabric
+#    SERIAL         - Mandatory - switch serial
+#    SNMP_INFO      - Mandatory - NDFC SNMP Trap info
+#    FABRIC_SETTINGS- Optional  - Current fabric settings. Will be obtained if not specified
+#
+def manageSnmpTrapHostPolicy(dictObj):
+    funcName = sys._getframe(0).f_code.co_name
+    respObj = WrappersResp.getRespObj()
+    respObj.setSuccessRetCode()
+
+    fabricName = dictObj.get("FABRIC_NAME", None)
+    swSerial = dictObj.get("SERIAL", None)
+
+    Wrapper.print("%s - FAB [%s] Sw [%s] Start" % (funcName, fabricName, swSerial))
+
+    try:
+        snmpInfoObj = dictObj.get("SNMP_INFO", None)
+        if snmpInfoObj is None:
+            return respObj
+        snmpInfo = json.loads(snmpInfoObj)
+        Wrapper.print("%s: NDFC SNMP properties %s" % (funcName, json.dumps(snmpInfo, indent=4, sort_keys=True)))
+
+        fabricSettings = dictObj.get("FABRIC_SETTINGS", None)
+        if not fabricSettings:
+            fabricSettings = Util.exe(FabricWrapper.get(fabricName)).getNvPairs()
+        gblSnmpServerHost = fabricSettings.get("SNMP_SERVER_HOST_TRAP", "false")
+
+        ff = Util.exe(FabricWrapper.get(fabricName, "FF"))
+        if ff != "Easy_Fabric_IOS_XE":
+            templateName = "snmp_server_host_trap"
+        else:
+            if dictObj.get("IS_IOS_XE") == "true":
+                templateName = "ios_xe_snmp_server_host_trap"
+            else:
+                templateName = "snmp_server_host_trap"
+
+        # Wrapper.print("%s: gblSnmpServerHost [%s]" % (funcName, gblSnmpServerHost))
+        if (gblSnmpServerHost == "true"):
+            # generate the SNMP trap host IP based on the OOB network mode
+            # Fetch IPv4 or IPv6 address based on discovered IP of the switch
+            deviceIP = Util.exe(Helper.getSeedIp(swSerial))
+            if Util.isIpv6Addr(deviceIP):
+                dataTrapIP = snmpInfo.get("data_trap_ipv6", None)
+                mgmtTrapIP = snmpInfo.get("mgmt_trap_ipv6", None)
+            else:
+                dataTrapIP = snmpInfo.get("data_trap_ip", None)
+                mgmtTrapIP = snmpInfo.get("mgmt_trap_ip", None)
+            
+            oobNwMode = snmpInfo.get("global.oob_network_mode")
+            trapIp = None
+            if oobNwMode == "Data":
+                trapIp = dataTrapIP
+            else:
+                trapIp = mgmtTrapIP
+
+            Wrapper.print("%s: oobNwMode [%s] mgmtTrapIP [%s] dataTrapIP [%s] Sw [%s] trapIp [%s]" % (funcName, 
+                                                oobNwMode, mgmtTrapIP, dataTrapIP, swSerial, trapIp))
+
+            if trapIp is None:
+                # report an error
+                respObj.addErrorReport(getFabErrEntity(funcName, swSerial),
+                           ("NDFC [%s] SNMP Trap IP Address is not configured. Please configure and retry." % (oobNwMode)))
+                respObj.setFailureRetCode()
+                return respObj
+
+            setSNMPV3Trap = False if snmpInfo.get("core.trap_v3enable", "true") == "false" else True
+            snmpSendPort = snmpInfo.get("global.trap_port", "2162")
+            snmpV2CommString = snmpInfo.get("global.snmp_defaultCommunity", "public")
+            if setSNMPV3Trap:
+                commStr = Util.exe(Helper.getDiscoveryUser(swSerial))
+                Wrapper.print("%s: getDiscoveryUser: commStr [%s]" % (funcName, commStr))
+                # hardcode to 'admin' till the above API returns the correct data
+                # commStr = "admin"
+                snmpVer = "3"
+            else:
+                commStr = snmpV2CommString
+                snmpVer = "2c"
+            Wrapper.print("%s: Trap IP [%s] SNMP ver [%s] Community String [%s] port [%s]" % (funcName, trapIp, snmpVer, commStr, snmpSendPort))
+
+        createSnmpPti = False
+        foundMatch = False
+        ptiList = Util.exe(PTIWrapper.get(swSerial, "SWITCH", "SWITCH", "UNDERLAY", templateName))
+        if ptiList:
+            for pti in ptiList:
+                if pti.isDeleted():
+                    continue
+
+                Wrapper.print("%s: Processing PTI [%s] nvpairs [%s]" % (funcName, pti.getPolicyId(), pti.getNvPairs()))
+
+                if (gblSnmpServerHost == "false"):
+                    PTIWrapper.markDeleteInstance(pti.getPolicyId())
+                    continue
+
+                if ((trapIp != pti.nvPairs.get("IP")) or (snmpVer != pti.nvPairs.get("VER")) or
+                    (commStr != pti.nvPairs.get("CS")) or (snmpSendPort != pti.nvPairs.get("UDP_PORT"))):
+                    PTIWrapper.markDeleteInstance(pti.getPolicyId())
+                    if not foundMatch:
+                        createSnmpPti = True
+                else:
+                    foundMatch = True
+                    createSnmpPti = False
+        else:
+            # no PTIs exist currently
+            createSnmpPti = True
+
+        if (gblSnmpServerHost == "true"):
+            if not createSnmpPti and not foundMatch:
+                # This can occur in this sequence:
+                #  - setting is enabled with the trap host config deploy
+                #  - disable + S & D (PTI will be mark deleted)
+                #  - enable + S & D
+                createSnmpPti = True
+            if createSnmpPti:
+                Util.exe(PTIWrapper.create(swSerial, "SWITCH", "SWITCH", "UNDERLAY",
+                                ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP, templateName,
+                                {"IP":trapIp, "VER":snmpVer, "CS":commStr, "UDP_PORT":snmpSendPort}))
+    except Exception as e:
+        Wrapper.print("%s - FAB [%s] Sw [%s] Exception [%s]" % (funcName, fabricName, swSerial, e))
+        if isinstance(e, respObjError):
+            Util.processRespObj(respObj, e.value)
+        else:
+            Util.handleException(("Unexpected error creating SNMP Trap Host Policy for switch [%s]. Please retry and if "
+                "issue persists, contact Cisco TAC") % (swSerial), e, respObj)
+    finally:
+        Wrapper.print("%s - FAB [%s] Sw [%s] Finish. Success = [%r]" % (funcName, fabricName, swSerial, respObj.isRetCodeSuccess()))
+        return respObj
+
+def isDeviceTmpltPresent(deviceSn, templateName):
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setTemplateName(templateName)
+    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    pti_found = False
+    for pti in ptiList:
+        if pti.isDeleted():
+            continue
+        pti_found = True
+        break
+    return pti_found
+
+def isIntfTmpltConfigPresent(deviceSn, templateName):
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setEntityType("INTERFACE")
+    srchOpt.setTemplateContentType("PYTHON")
+    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    pti_found = False
+    for pti in ptiList:
+        if pti.isDeleted():
+            continue
+        if "interface_ipv4_netflow" in templateName and "ip flow monitor" in pti.getGeneratedConfig():
+            pti_found = True
+            break
+        if "interface_l2_netflow" in templateName and "layer2-switched flow monitor" in pti.getGeneratedConfig():
+            pti_found = True
+            break
+    return pti_found
+
+def isPolicyPresent(deviceSn, templateName):
+    srchOpt = CtrlPolicySearch()
+    srchOpt.setSerialNumber(deviceSn)
+    srchOpt.setTemplateName(templateName)
+    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+    pti_found = False
+    for pti in ptiList:
+        if pti.isDeleted():
+            continue
+        pti_found = True
+        break
+    return pti_found
+
+def validateInitFabricSettings(dictObj):
+    funcName = sys._getframe(0).f_code.co_name
+
+    try:
+        FABRIC_NAME = dictObj.get("FABRIC_NAME", "")
+        Wrapper.print("========== FAB [%s]: Start: %s" % (FABRIC_NAME, funcName))
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        
+        validationParams = dictObj.get("FABRIC_VALIDATION_PARAMS", {})
+        Wrapper.print("%s: validationParams: %s" % (funcName, validationParams))
+        
+        validateManagebilitySettings = validationParams.get("validateManagebilitySettings", False)
+        validateNetflowSettings = validationParams.get("validateNetflowSettings", False)
+        validateLanDeviceConnectivityMode = validationParams.get("validateLanDeviceConnectivityMode", False)
+        validatePvlanSettings = validationParams.get("validatePvlanSettings", False)
+        validateNxCloudSettings = validationParams.get("validateNxCloudSettings", False)
+        validateL3vniMode = validationParams.get("validateL3vniMode", False)
+        validateBgpAsn = validationParams.get("validateBgpAsn", False)
+
+        if validateManagebilitySettings:
+            Util.exe(validateManageabilityTabSettings(dictObj))
+        if validateNetflowSettings:
+            Util.exe(validateNetflowTabSettings(dictObj))
+        if validateLanDeviceConnectivityMode:
+            Util.exe(checkLanDeviceConnectivityMode(dictObj))
+        if validatePvlanSettings:
+            Util.exe(validatePvlanFabSettings(dictObj))
+        if validateNxCloudSettings:
+            Util.exe(checkNxCloudSettings(dictObj))
+        if validateL3vniMode:
+            Util.exe(checkL3VniNoVlanSettings(dictObj))
+        if validateBgpAsn:
+            Util.exe(validateBgpAsnFabSettings(dictObj))
+
+    except Exception as e:
+        if isinstance(e, respObjError):
+            Util.processRespObj(respObj, e.value)
+        else:
+            Util.handleException("Unexpected error validating fabric settings", e, respObj)
+    finally:
+        Wrapper.print("========== FAB [%s]: Finish: %s: Success = [%r]" %
+                (FABRIC_NAME, funcName, respObj.isRetCodeSuccess()))
+        return respObj
+
+def checkLanDeviceConnectivityMode(dictionaryObj):
+    funcName = sys._getframe(0).f_code.co_name
+    respObj = WrappersResp.getRespObj()
+    respObj.setSuccessRetCode()
+
+    fabInbandMode = dictionaryObj.get("INBAND_MGMT", "false")
+    # get the current LAN Device Connectivity server setting
+    oobMode = Util.exe(FabricWrapper.getLanMgmtConnectivityMode())
+    Wrapper.print("%s: fabInbandMode [%s] oobMode [%s]" % (funcName, fabInbandMode, oobMode))
+    isError = False
+    if fabInbandMode == "true":
+        if oobMode.lower() == "management":
+            isError = True
+
+    if isError:
+        errMsg = ("The 'LAN Device Management Connectivity' server setting is [%s] and is incompatible with the Inband Mode "
+            "fabric setting. Please review documentation and set the mode or server setting appropriately." % (oobMode))
+        respObj.addErrorReport("fabricInit:NDFC LAN Device Management", errMsg)
+        respObj.setFailureRetCode()
+
+    return respObj
+
+def validateNetflowTabSettings(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        Wrapper.print("======== %s ==========" % funcName)
+        FABRIC_NAME             = dictObj["FABRIC_NAME"]
+        fabricSettings          = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ENABLE_NETFLOW          = fabricSettings.get("ENABLE_NETFLOW", "false")
+        ENABLE_NETFLOW_PREV     = fabricSettings.get("ENABLE_NETFLOW_PREV", "false")
+        NETFLOW_EXPORTER_LIST   = fabricSettings.get("NETFLOW_EXPORTER_LIST", "")
+        NETFLOW_RECORD_LIST     = fabricSettings.get("NETFLOW_RECORD_LIST", "")
+        NETFLOW_MONITOR_LIST    = fabricSettings.get("NETFLOW_MONITOR_LIST", "")
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        Wrapper.print("%s: ENABLE_NETFLOW [%s], ENABLE_NETFLOW_PREV [%s]" % (funcName, ENABLE_NETFLOW, ENABLE_NETFLOW_PREV))
+        if ENABLE_NETFLOW == "true":
+
+            records = []
+            exporters = []
+            missing_records = []
+            missing_exporters = []
+
+            if NETFLOW_EXPORTER_LIST:
+                exporter_list = ast.literal_eval(NETFLOW_EXPORTER_LIST)
+                for exporter in exporter_list["NETFLOW_EXPORTER_LIST"]:
+                    exporters.append(exporter["EXPORTER_NAME"])
+
+            if NETFLOW_RECORD_LIST:
+                record_list = ast.literal_eval(NETFLOW_RECORD_LIST)
+                missingTemplates = []
+                for record in record_list["NETFLOW_RECORD_LIST"]:
+                    records.append(record["RECORD_NAME"])
+    
+                    # check whether record_template exist or not
+                    if record["RECORD_TEMPLATE"] not in missingTemplates:
+                        recordTemplatePresent = Util.exe(PTIWrapper.isTemplatePresent(record["RECORD_TEMPLATE"]))
+                        if not recordTemplatePresent:
+                            missingTemplates.append(record["RECORD_TEMPLATE"])
+    
+                if len(missingTemplates) != 0:
+                    errMsg = ("Only existing templates can be used as Netflow Record Template. "
+                              "Missing template%s %s." % ("s" if len(missingTemplates)>1 else "", str(missingTemplates)[1:-1]))
+                    Wrapper.print("%s: %s" % (funcName, errMsg)) 
+                    respObj.addErrorReport("validateNetflowTabSettings", errMsg)
+                    respObj.setFailureRetCode()
+                    return respObj
+
+            if NETFLOW_MONITOR_LIST:
+                monitor_list = ast.literal_eval(NETFLOW_MONITOR_LIST)
+                for monitor in monitor_list["NETFLOW_MONITOR_LIST"]:
+                    if (monitor["RECORD_NAME"] not in records) and (monitor["RECORD_NAME"] not in missing_records):
+                        missing_records.append(monitor["RECORD_NAME"])
+                    if (monitor["EXPORTER1"] not in exporters) and (monitor["EXPORTER1"] not in missing_exporters):
+                        missing_exporters.append(monitor["EXPORTER1"])
+                    if ("EXPORTER2" in monitor) and (monitor["EXPORTER2"] != "") and \
+                        (monitor["EXPORTER2"] not in exporters) and (monitor["EXPORTER2"] not in missing_exporters):
+                        missing_exporters.append(monitor["EXPORTER2"])
+
+            if len(missing_records) != 0 or len(missing_exporters) != 0:
+                errMsg = ""
+                if len(missing_records) != 0:
+                    if len(missing_records) == 1:
+                        be = "is"
+                    else:
+                        be = "are"
+                    errMsg = "%s referred in 'Netflow Monitor' %s not defined in 'Netflow Record'. Please define them first. " % (missing_records, be)
+                if len(missing_exporters) != 0:
+                    if len(missing_exporters) == 1:
+                        be = "is"
+                    else:
+                        be = "are"
+                    errMsg += "%s referred in 'Netflow Monitor' %s not defined in 'Netflow Exporter'. Please define them first. " % (missing_exporters, be)
+
+                Wrapper.print(errMsg)
+                respObj.addErrorReport("validateNetflowTabSettings", errMsg)
+                respObj.setFailureRetCode()
+        else:
+            # netflow not enabled
+            if ENABLE_NETFLOW_PREV == "false":
+                return respObj
+
+            # check any reference to netflow in vrf/network and interface/vlan level
+            topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+            devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+            devices = filter(None, devices)
+            netflow_pti_found = False
+
+            for deviceSn in devices:
+                netflow_pti_found = isIntfTmpltConfigPresent(deviceSn, "interface_ipv4_netflow")
+                if netflow_pti_found:
+                    break
+
+                netflow_pti_found = isIntfTmpltConfigPresent(deviceSn, "interface_l2_netflow")
+                if netflow_pti_found:
+                    break
+
+                netflow_pti_found = isDeviceTmpltPresent(deviceSn, "vlan_netflow")
+                if netflow_pti_found:
+                    break
+
+                netflow_pti_found = isDeviceTmpltPresent(deviceSn, "vlan_netflow_sampler")
+                if netflow_pti_found:
+                    break
+
+            if netflow_pti_found:
+                errMsg = "Netflow is enabled at some interfaces, VRFs and/or Networks. "\
+                         "Please disable netflow on interface, VRFs and Networks before disable netflow at the fabric setting. "
+                Wrapper.print(errMsg)
+                respObj.addErrorReport("validateNetflowTabSettings", errMsg)
+                respObj.setFailureRetCode()
+
+        if ENABLE_NETFLOW_PREV != ENABLE_NETFLOW:
+            Wrapper.print("update ENABLE_NETFLOW_PREV to %s" % ENABLE_NETFLOW)
+            Util.exe(FabricWrapper.update(FABRIC_NAME, "ENABLE_NETFLOW_PREV", ENABLE_NETFLOW))
+
+        Wrapper.print("====== end of %s =======" % funcName)
+        return respObj
+
+    except respObjError as e:
+        return e.value
+
+def isModelNetflowSupported(model):
+    if model and model.startswith("N7"):
+        return True
+    else:
+        return model and model.startswith("N9K") and ("-EX" in model or "-FX" in model or "-GX" in model)
+
+def isNetflowSupported(topologyDataObj, deviceSn):
+    funcName = sys._getframe(0).f_code.co_name
+    devModel = topologyDataObj.getSwitchModel(deviceSn)
+    devModules = topologyDataObj.getSwitchModules(deviceSn)
+
+    hw_supported = isEX = l2NetflowSupported = False
+
+    if devModules:
+        for module in devModules:
+            model = module.get("ModelName")
+            if model is None:
+                # the model name is not present.. skip
+                continue
+            if isModelNetflowSupported(model):
+                hw_supported = True
+                if "-EX" in model:
+                    isEX = True
+    else:
+        if isModelNetflowSupported(devModel):
+            hw_supported = True
+            if "-EX" in devModel:
+                isEX = True
+
+    if hw_supported:
+        if isEX:
+            nxosImageDetail = Util.exe(ImageManagementWrapper.getNXOSSysDescription(deviceSn))
+
+            try:
+                imgVersion = nxosImageDetail.split("Version ")[1].split(",")[0] if nxosImageDetail.split("Version ")[1] else ""
+            except:
+                imgVersion = ""
+
+            if not imgVersion:
+                imgVersion = Util.exe(ImageManagementWrapper.getNXOSVersion(deviceSn))
+
+            try:
+                imgMajorVer = imgVersion.split(".")[0]
+                if int(imgMajorVer)  >= 9:
+                    l2NetflowSupported = True
+            except:
+                Wrapper.print("%s: %s invalid image version %s" % (funcName, deviceSn, imgVersion))
+        else:
+            l2NetflowSupported = True
+
+    Wrapper.print("%s: %s model %s, netflow_supported %s,l2NetflowSupported %s"
+        % (funcName, deviceSn, devModel, hw_supported, l2NetflowSupported))
+
+    return hw_supported, l2NetflowSupported, isEX
+
+def allowNetflowConfig(dictObj):
+    try:
+        funcName            = sys._getframe(0).f_code.co_name
+        FABRIC_NAME         = dictObj["FABRIC_NAME"]
+        deviceSn            = dictObj["DEVICE_SN"]
+        respObj             = WrappersResp.getRespObj()
+        errorMsg            = ""
+        allowNetflow        = True
+        l2NetflowSupported  = False
+        isEX                = False
+        topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+
+        if "SOURCE" not in dictObj:
+            # SOURCE of topdown does not need to check fabric setting or role
+            fabricSettings = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+            if "ENABLE_NETFLOW" not in fabricSettings or fabricSettings["ENABLE_NETFLOW"] != "true":
+                allowNetflow = False
+                errorMsg = "Netflow can not be enabled while it is not enabled on fabric."
+            else:
+                fabricType = Util.exe(Helper.getFabricType(FABRIC_NAME))
+                if fabricType == "Switch_Fabric":
+                    switchRole = topologyDataObj.getSwitchRole(deviceSn)
+                    if switchRole == "spine" or switchRole == "super spine":
+                        allowNetflow = False
+                        errorMsg = "NDFC does not support netflow on Spine or Super Spine in VXLAN fabric."
+                elif fabricType != "External":
+                    allowNetflow = False
+                    errorMsg = "Netflow is not supported in fabric of type %s" % fabricType
+
+        if allowNetflow:
+            if isDeviceTmpltPresent(deviceSn, "no_netflow"):
+                allowNetflow = False
+                if "SOURCE" in dictObj:
+                    errorMsg = "Netflow configuration is not generated with the presence of policy 'no_netflow'."
+                else:
+                    errorMsg = "Netflow cannot be enabled with the presence of policy 'no_netflow'."
+
+        if allowNetflow:
+            netflowSupported, l2NetflowSupported, isEX = isNetflowSupported(topologyDataObj, deviceSn)
+            if not netflowSupported:
+                allowNetflow = False
+                errorMsg = "Netflow is not supported on %s. Netflow is only supported on N9K EX, FX, GX models and N7K." % topologyDataObj.getSwitchModel(deviceSn)
+            elif "IS_LAYER2" in dictObj and dictObj["IS_LAYER2"] == "true" and not l2NetflowSupported:
+                allowNetflow = False
+                errorMsg = "Platform does not support L2 netflow. Please disable Netflow on this interface."
+            elif "NETFLOW_SAMPLER" in dictObj and dictObj["NETFLOW_SAMPLER"]:
+                devModel = Util.exe(InventoryWrapper.getSwitchModel(deviceSn))
+                if not devModel.startswith("N7"):
+                    allowNetflow = False
+                    errorMsg = "Netflow sampler is not supported on %s" % devModel
+
+        Wrapper.print("%s - [%s]: allowNetflow [%s], errorMsg [%s]" % (funcName, deviceSn, allowNetflow, errorMsg))
+
+        if not allowNetflow:
+            respObj.setValue({"ERROR_MSG": errorMsg})
+            respObj.addErrorReport(deviceSn + ":" + funcName, errorMsg)
+            respObj.setFailureRetCode()
+            return respObj
+
+        returnDict = {"l2_supported": l2NetflowSupported, "isEX": isEX}
+        respObj.setValue(returnDict)
+        respObj.setSuccessRetCode()
+        return respObj
+    except respObjError as e:
+        return e.value
+
+# caller provides DEVICES, FABRIC_NAME, topologyDataObj
+def netflowConfigGen(dictObj):
+    try:
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        devices = dictObj["DEVICES"]
+        FABRIC_NAME = dictObj["FABRIC_NAME"]
+        fabricSettings = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        dictObj.update({"ENABLE_NETFLOW": fabricSettings.get("ENABLE_NETFLOW", "false")})
+        dictObj.update({"NETFLOW_EXPORTER_LIST": fabricSettings.get("NETFLOW_EXPORTER_LIST", "")})
+        dictObj.update({"NETFLOW_RECORD_LIST":fabricSettings.get("NETFLOW_RECORD_LIST", "")})
+        dictObj.update({"NETFLOW_MONITOR_LIST": fabricSettings.get("NETFLOW_MONITOR_LIST", "")})
+        dictObj.update({"NETFLOW_SAMPLER_LIST": fabricSettings.get("NETFLOW_SAMPLER_LIST", "")})
+        for deviceSn in devices:
+            dictObj.update({"DEVICE_SN": deviceSn})
+            newRespObj = netflowConfigGenDevice(dictObj)
+            if not newRespObj.isRetCodeSuccess():
+                Wrapper.print("netflowConfigGen: transfer warning message from %s" % (deviceSn))
+                Util.processRespObj(respObj, newRespObj)
+
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def netflowConfigGenDevice(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        deviceSn = dictObj["DEVICE_SN"]
+        Wrapper.print("======== %s [%s] ==========" % (funcName, deviceSn))
+
+        ENABLE_NETFLOW          = dictObj["ENABLE_NETFLOW"]
+        NETFLOW_EXPORTER_LIST   = dictObj["NETFLOW_EXPORTER_LIST"]
+        NETFLOW_RECORD_LIST     = dictObj["NETFLOW_RECORD_LIST"]
+        NETFLOW_MONITOR_LIST    = dictObj["NETFLOW_MONITOR_LIST"]
+        NETFLOW_SAMPLER_LIST    = dictObj["NETFLOW_SAMPLER_LIST"]
+        skip_netflow            = False
+
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        if ENABLE_NETFLOW == "true":
+            respObj1 = allowNetflowConfig(dictObj)
+            returnDict = respObj1.getValue()
+            if respObj1.isRetCodeFailure():
+                Wrapper.print("%s() allowNetflowConf error returnDict %s" % (funcName, returnDict))
+                if "ERROR_MSG" in returnDict:
+                    if not "Spine" in returnDict["ERROR_MSG"]:
+                        respObj.addWarnReport(getFabErrEntity(funcName, deviceSn),
+                                              returnDict["ERROR_MSG"],
+                                              deviceSn)
+
+                        respObj.setWarningRetCode()
+                skip_netflow = True
+
+        # remove existing netflow policies
+        # The use of "NETFLOW" as source makes search easier, as the customized record template name is not known
+        srchOpt = CtrlPolicySearch()
+        srchOpt.setSerialNumber(deviceSn)
+        srchOpt.setSource("NETFLOW")
+        ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+        for pti in ptiList:
+            PTIWrapper.markDeleteInstance(pti.getPolicyId())
+
+        if ENABLE_NETFLOW == "true" and not skip_netflow:
+            Util.exe(PTIWrapper.createOrUpdate(deviceSn, "SWITCH", "SWITCH", "NETFLOW",
+                                               ConfigPriority.CONFIG_PRIO_TOP,
+                                               "feature_netflow", {}))
+
+            if NETFLOW_EXPORTER_LIST and len(NETFLOW_EXPORTER_LIST) > 0: 
+                exporter_list = ast.literal_eval(NETFLOW_EXPORTER_LIST)
+                for exporter in exporter_list["NETFLOW_EXPORTER_LIST"]:
+                    if "VRF" in exporter:
+                        vrf_name = exporter["VRF"]
+                        vrf_name = vrf_name.lstrip(" ")
+                    else:
+                        vrf_name = ""
+    
+                    src_intf = Util.exe(Helper.getInterfaceName2(exporter["SRC_IF_NAME"]))
+                    # In switch, loopback, mgmt, port-channel as exporter source are lower case, vlan is upper case
+                    if src_intf.startswith("Loop"):
+                        src_intf = "l" + src_intf[1:]
+                    elif src_intf.startswith("Port"):
+                        src_intf = "p" + src_intf[1:]
+                    elif src_intf.startswith("M"):
+                        src_intf = "m" + src_intf[1:]
+                    elif src_intf.startswith("v"):
+                        src_intf = "V" + src_intf[1:]
+    
+                    Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "NETFLOW",
+                                               ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP_LVL1,
+                                               "netflow_exporter",
+                                               {"EXPORTER_NAME": exporter["EXPORTER_NAME"],
+                                                "IP": exporter["IP"],
+                                                "VRF": vrf_name,
+                                                "SRC_IF_NAME": src_intf,
+                                                "UDP_PORT": exporter["UDP_PORT"]}))
+
+            if NETFLOW_RECORD_LIST and len(NETFLOW_RECORD_LIST) > 0:
+                record_list = ast.literal_eval(NETFLOW_RECORD_LIST)
+                l2_record = []
+                for record in record_list["NETFLOW_RECORD_LIST"]:
+                    if not returnDict["l2_supported"] and record["LAYER2_RECORD"] == "true":
+                        l2_record.append(record["RECORD_NAME"])
+                        warningMsg = "Netflow record and monitor for layer 2 will not be applied. EX Switch runnig pre 9.x NXOS image does not support Layer 2 netflow."
+                        Wrapper.print("%s: %s: %s" % (funcName, deviceSn, warningMsg))
+                        respObj.addWarnReport(getFabErrEntity(funcName, deviceSn), warningMsg, deviceSn)
+                        respObj.setWarningRetCode()
+                        continue
+    
+                    Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "NETFLOW",
+                                               ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP_LVL1,
+                                               record["RECORD_TEMPLATE"],
+                                               {"RECORD_NAME": record["RECORD_NAME"]}))
+
+            if NETFLOW_MONITOR_LIST and len(NETFLOW_MONITOR_LIST) > 0:
+                monitor_list = ast.literal_eval(NETFLOW_MONITOR_LIST)
+                for monitor in monitor_list["NETFLOW_MONITOR_LIST"]:
+                    if not returnDict["l2_supported"] and monitor["RECORD_NAME"] in l2_record:
+                        continue
+    
+                    if "EXPORTER2" in monitor:
+                        exporter2 = monitor["EXPORTER2"]
+                        exporter2 = exporter2.lstrip(" ")
+                    else:
+                        exporter2 = ""
+                    Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "NETFLOW",
+                                               ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP_LVL2,
+                                               "netflow_monitor",
+                                               {"MONITOR_NAME": monitor["MONITOR_NAME"],
+                                                "RECORD_NAME": monitor["RECORD_NAME"],
+                                                "EXPORTER1": monitor["EXPORTER1"],
+                                                "EXPORTER2": exporter2}))
+
+            if NETFLOW_SAMPLER_LIST and len(NETFLOW_SAMPLER_LIST) > 0:
+                sampler_list = ast.literal_eval(NETFLOW_SAMPLER_LIST)
+                topologyDataObj = dictObj["topologyDataObj"]
+                devModel = topologyDataObj.getSwitchModel(deviceSn)
+                if devModel.startswith("N7"):
+                    for sampler in sampler_list["NETFLOW_SAMPLER_LIST"]:
+                        Util.exe(PTIWrapper.create(deviceSn, "SWITCH", "SWITCH", "NETFLOW",
+                                           ConfigPriority.CONFIG_PRIO_UNDERLAY_TOP_LVL2,
+                                           "netflow_sampler",
+                                           {"SAMPLER_NAME": sampler["SAMPLER_NAME"],
+                                            "NUM_SAMPLES": sampler["NUM_SAMPLES"],
+                                            "SAMPLING_RATE": sampler["SAMPLING_RATE"]}))
+
+    except Exception as e:
+        errMsg = "Unexpected error creating netflow policies for switch [%s]." % deviceSn
+        if isinstance(e, respObjError):
+            respObj.addErrorReport(funcName, errMsg)
+            respObj.setFailureRetCode()
+            Util.processRespObj(respObj, e.value)
+        else:
+            Util.handleException(errMsg, e, respObj)
+    finally:
+        Wrapper.print("======== end of %s [%s] ========== Success = [%r]" % (funcName, deviceSn, respObj.isRetCodeSuccess()))
+        return respObj
+
+def validatePvlanFabSettings(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        Wrapper.print("======== %s ==========" % funcName)
+        FABRIC_NAME           = dictObj["FABRIC_NAME"]
+        fabricSettings        = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ENABLE_PVLAN          = fabricSettings.get("ENABLE_PVLAN", "false")
+        ENABLE_PVLAN_PREV     = fabricSettings.get("ENABLE_PVLAN_PREV", "false")
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        Wrapper.print("%s: ENABLE_PVLAN [%s], ENABLE_PVLAN_PREV [%s]" % (funcName, ENABLE_PVLAN, ENABLE_PVLAN_PREV))
+        if ENABLE_PVLAN_PREV == ENABLE_PVLAN:
+            return respObj
+
+        fabricType = Util.exe(Helper.getFabricType(FABRIC_NAME))
+        if fabricType == "Switch_Fabric":
+            try:
+                getRespObj = FabricWrapper.getParentFabricName(FABRIC_NAME)
+                if getRespObj.isRetCodeSuccess():
+                    errMsg = "Cannot change 'Enable Private VLAN' in the child fabric."
+                    Wrapper.print("%s: %s" % (funcName, errMsg))
+                    respObj.addErrorReport(funcName, errMsg)
+                    respObj.setFailureRetCode()
+                    return respObj
+            except:
+                pass
+
+        if ENABLE_PVLAN != "true":
+            # PVLAN to be disabled. Check whether any pvlan policy or network
+            if fabricType == "Switch_Fabric":
+                if not isDisablePvlanAllowed(FABRIC_NAME, respObj, True):
+                    return respObj
+            elif fabricType == "MFD":
+                # check PVLAN Networks
+                respObj2 = TopDownOverlayWrapper.arePvlanOverlaysPresent(FABRIC_NAME)
+                if respObj2.isRetCodeSuccess():
+                    pvlan_network_present = respObj2.getValue()
+                    if pvlan_network_present:
+                        errMsg = "Can not disable Private VLAN (PVLAN) in the fabric setting while PVLAN Network is present. "
+                        Wrapper.print("%s: %s" % (funcName, errMsg))
+                        respObj.addErrorReport(funcName, errMsg)
+                        respObj.setFailureRetCode()
+                        return respObj
+
+                mfdResp = MfdWrapper.getMfdFabricList(FABRIC_NAME)
+                if not mfdResp.isRetCodeSuccess():
+                    respObj.addErrorReport(funcName, "Failed to get Fabric List for %s "% (FABRIC_NAME))
+                    respObj.setFailureRetCode()
+                    return respObj
+
+                fabricList = mfdResp.getFabricNameList()
+                for fabricName in fabricList:
+                    fabricType = Util.exe(Helper.getFabricType(fabricName))
+                    if fabricType != "Switch_Fabric":
+                        continue
+
+                    mFabricSettings = Util.exe(FabricWrapper.get(fabricName)).getNvPairs()
+                    if "ENABLE_PVLAN" in mFabricSettings and mFabricSettings["ENABLE_PVLAN"] == "true":
+                        if not isDisablePvlanAllowed(fabricName, respObj, False):
+                            return respObj
+        else:
+            # about to enable PVLAN. Block if there is any IOS XE fabric
+            mfdResp = MfdWrapper.getMfdFabricList(FABRIC_NAME)
+            if not mfdResp.isRetCodeSuccess():
+                respObj.addErrorReport(funcName, "Failed to get Fabric List for %s "% (FABRIC_NAME))
+                respObj.setFailureRetCode()
+                return respObj
+
+            fabricList = mfdResp.getFabricNameList()
+            for fabricName in fabricList:
+                FF = Util.exe(FabricWrapper.get(fabricName, "FF"))
+                if FF == "Easy_Fabric_IOS_XE":
+                    errMsg = "Private VLAN is not supported in Campus VXLAN EVPN fabric. Can not enable Private VLAN with the presence of Campus VXLAN EVPN fabric as child fabric. "
+                    Wrapper.print("%s: %s" % (funcName, errMsg))
+                    respObj.addErrorReport(funcName, errMsg)
+                    respObj.setFailureRetCode()
+                    return respObj
+
+        Wrapper.print("====== end of %s: pass =======" % funcName)
+        return respObj
+
+    except respObjError as e:
+        return e.value
+
+# for BGP fabric only
+def validateBgpAsnFabSettings(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        Wrapper.print("======== %s ==========" % funcName)
+        FABRIC_NAME           = dictObj["FABRIC_NAME"]
+        fabricSettings        = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        BGP_AS                = fabricSettings.get("BGP_AS", "")
+        LEAF_BGP_AS           = fabricSettings.get("LEAF_BGP_AS", "")
+        BORDER_BGP_AS         = fabricSettings.get("BORDER_BGP_AS", "")
+        SUPER_SPINE_BGP_AS    = fabricSettings.get("SUPER_SPINE_BGP_AS", "")
+        BGP_AS_MODE           = fabricSettings.get("BGP_AS_MODE", "")
+        BGP_AS_MODE_PREV      = fabricSettings.get("BGP_AS_MODE_PREV", "")
+
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        if BGP_AS_MODE != BGP_AS_MODE_PREV and BGP_AS_MODE == "Multi-AS":
+            # Same-Tier-AS to Multi-AS not allowed if overlay present and leaf_bgp_asn not present
+            topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+            devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+            devices = filter(None, devices)
+            srchOpt = CtrlPolicySearch()
+            errMsg = ""
+            for deviceSn in devices:
+                switchRole = topologyDataObj.getSwitchRole(deviceSn)
+                if "spine" in switchRole:
+                    continue
+
+                if not CommonDAO.isOverlayAllowingRoleChange(deviceSn):
+                    # Overlay present
+                    srchOpt.setSerialNumber(deviceSn)
+                    srchOpt.setTemplateName("leaf_bgp_asn")
+                    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                    if not ptiList:
+                        hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+                        errorMsg = "BGP AS mode cannot be changed from Same-Tier-AS to Multi-AS with the presence of overlay config on %s %s which does not have BGP AS defined" % (switchRole,hostName)
+                        Wrapper.print("%s: %s" % (funcName, errorMsg))
+                        respObj.addErrorReport(funcName, errorMsg)
+                        respObj.setFailureRetCode()
+                        return respObj
+
+                if switchRole == "border gateway":
+                    srchOpt.setSerialNumber(deviceSn)
+                    srchOpt.setTemplateName("ext_base_border_multisite")
+                    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                    if ptiList:
+                        srchOpt.setTemplateName("leaf_bgp_asn")
+                        ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                        if not ptiList:
+                            hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+                            errorMsg = "BGP AS mode cannot be changed from Same-Tier-AS to Multi-AS with the presence of ext_base_border_multisite policy on %s %s which does not have BGP AS defined" % (switchRole,hostName)
+                            Wrapper.print("%s: %s" % (funcName, errorMsg))
+                            respObj.addErrorReport(funcName, errorMsg)
+                            respObj.setFailureRetCode()
+                            return respObj
+
+        if BGP_AS_MODE != "Same-Tier-AS":
+            return respObj
+
+        if LEAF_BGP_AS:
+            Util.exe(Helper.isValidAsn(LEAF_BGP_AS))
+            if LEAF_BGP_AS == BGP_AS or LEAF_BGP_AS == SUPER_SPINE_BGP_AS:
+                errorMsg = "Leaf BGP AS number cannot be the same as Spine BGP ASN or Super Spine BGP ASN"
+                Wrapper.print("%s: %s" % (funcName, errorMsg))
+                respObj.addErrorReport(funcName, errorMsg)
+                respObj.setFailureRetCode()
+                return respObj
+
+        if BORDER_BGP_AS:
+            Util.exe(Helper.isValidAsn(BORDER_BGP_AS))
+            if BORDER_BGP_AS == BGP_AS or BORDER_BGP_AS == SUPER_SPINE_BGP_AS:
+                errorMsg = "Border BGP AS number cannot be the same as Spine BGP ASN or Super Spine BGP ASN"
+                Wrapper.print("%s: %s" % (funcName, errorMsg))
+                respObj.addErrorReport(funcName, errorMsg)
+                respObj.setFailureRetCode()
+                return respObj
+
+        topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+        devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+        devices = filter(None, devices)
+        srchOpt = CtrlPolicySearch()
+
+        errMsg = ""
+        for deviceSn in devices:
+            switchRole = topologyDataObj.getSwitchRole(deviceSn)
+            if "spine" in switchRole:
+                continue
+
+            policyLeafBgpAsn = ""
+            srchOpt.setSerialNumber(deviceSn)
+            srchOpt.setTemplateName("bgp_asn")
+            ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+            for pti in ptiList:
+                if pti.isDeleted() == False:
+                    policyLeafBgpAsn = pti.getNvPairs()["BGP_AS"]
+
+            if switchRole == "leaf":
+                fabricAsn = LEAF_BGP_AS
+                fabricAsnStr = "Leaf BGP ASN"
+            else:
+                fabricAsn = BORDER_BGP_AS
+                fabricAsnStr = "Border BGP ASN"
+
+            if fabricAsn:
+                if policyLeafBgpAsn and fabricAsn != policyLeafBgpAsn:
+                    hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+                    errMsg += ("%s in Fabric Settings cannot be different from BGP ASN in switch leaf_bgp_asn policy. "
+                               "Current %s in Fabric Settings is %s and switch %s has leaf_bgp_asn policy with BGP ASN %s. " %
+                               (fabricAsnStr, fabricAsnStr, fabricAsn, hostName, policyLeafBgpAsn))
+
+                if policyLeafBgpAsn == "":
+                    srchOpt.setTemplateName("base_bgp")
+                    ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                    for pti in ptiList:
+                        if pti.isDeleted() == False and fabricAsn != pti.getNvPairs()["BGP_AS"]:
+                            hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+                            errMsg += ("%s in Fabric Settings cannot be changed to %s as switch %s is already configured with BGP ASN %s. " \
+                                       %(fabricAsnStr, fabricAsn, hostName, pti.getNvPairs()["BGP_AS"]))
+            elif policyLeafBgpAsn == "":
+                overlayConfigPresent = False
+                if not CommonDAO.isOverlayAllowingRoleChange(deviceSn):
+                    overlayConfigPresent = True
+                else:
+                    srchOpt.setTemplateName("ebgp_overlay_leaf_all_neighbor")
+                    overlayPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                    if overlayPtiList:
+                        overlayConfigPresent = True
+                    elif switchRole == "border gateway":
+                        srchOpt.setTemplateName("ext_base_border_multisite")
+                        ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                        if ptiList:
+                            overlayConfigPresent = True
+
+                if overlayConfigPresent:
+                    hostName = Util.exe(InventoryWrapper.getHostName(deviceSn))
+                    errMsg += "%s in Fabric Settings cannot be removed with presence of overlay config, ebgp_overlay_leaf_all_neighbor or ext_base_border_multisite policy on %s. " % (fabricAsnStr, hostName)
+
+        if errMsg:
+            respObj.addErrorReport(funcName, errMsg)
+            respObj.setFailureRetCode()
+
+        Wrapper.print("====== end of %s: pass =======" % funcName)
+        return respObj
+
+    except respObjError as e:
+        return e.value
+
+def isDisablePvlanAllowed(fabric_name, respObj, checkOverlayPresent):
+    funcName = sys._getframe(0).f_code.co_name
+    topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(fabric_name)))
+    devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+    devices = filter(None, devices)
+    pvlan_pti_found = False
+
+    for deviceSn in devices:
+        if isPolicyPresent(deviceSn, "int_pvlan_host") or \
+           isPolicyPresent(deviceSn, "int_port_channel_pvlan_host") or \
+           isPolicyPresent(deviceSn, "int_vpc_pvlan_host") or \
+           isPolicyPresent(deviceSn, "create_pvlan"):
+            pvlan_pti_found = True
+            break
+
+    if pvlan_pti_found:
+        errMsg = "Can not disable PVLAN at the fabric setting while PVLAN interface/vlan policy is present on certain device(s). "
+        Wrapper.print("%s: %s" % (funcName, errMsg))
+        respObj.addErrorReport(funcName, errMsg)
+        respObj.setFailureRetCode()
+        return False
+
+    if not checkOverlayPresent:
+        return True
+
+    # check PVLAN Networks
+    respObj2 = TopDownOverlayWrapper.arePvlanOverlaysPresent(fabric_name)
+    if respObj2.isRetCodeSuccess():
+        pvlan_network_present = respObj2.getValue()
+        if pvlan_network_present:
+            errMsg = "Can not disable Private VLAN (PVLAN) in the fabric setting while PVLAN Network is present. "
+            Wrapper.print("%s: %s" % (funcName, errMsg))
+            respObj.addErrorReport(funcName, errMsg)
+            respObj.setFailureRetCode()
+            return False
+
+    return True
+
+def allowPvlanIntfConfig(dictObj):
+    try:
+        funcName            = sys._getframe(0).f_code.co_name
+        deviceSn            = dictObj["DEVICE_SN"]
+        respObj             = WrappersResp.getRespObj()
+        errorMsg            = ""
+
+        FABRIC_NAME = Util.exe(InventoryWrapper.getFabricNameForSwitch(deviceSn))
+        pvlan_allowed = Util.exe(FabricWrapper.get(FABRIC_NAME)).nvPairs.get("ENABLE_PVLAN", "true")
+        if pvlan_allowed != "true":
+            fabricTechnology = Util.exe(FabricWrapper.getFabricTechnology(FABRIC_NAME))
+            # allow to create pvlan interface policy in routed fabirc like in external fabric
+            if fabricTechnology != "eBGP_Routed_Fabric":
+                errorMsg = "Please enable Private VLAN (PVLAN) knob in fabric settings to use the PVLAN interface policy."
+        else:
+            topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+            switchRole = topologyDataObj.getSwitchRole(deviceSn)
+            if switchRole == "spine" or switchRole == "super spine":
+                errorMsg = "NDFC does not support PVLAN on Spine or Super Spine in VXLAN fabric."
+
+        if errorMsg:
+            Wrapper.print("%s: %s" % (funcName, errorMsg))
+            respObj.addErrorReport(deviceSn + ":" + funcName, errorMsg)
+            respObj.setFailureRetCode()
+            return respObj
+
+        respObj.setSuccessRetCode()
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def disableDCIMACsecAllowedCheck(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        ENABLE_DCI_MACSEC = dictObj["ENABLE_DCI_MACSEC"]
+        ENABLE_DCI_MACSEC_PREV = dictObj["ENABLE_DCI_MACSEC_PREV"]
+        ENABLE_QKD = dictObj["ENABLE_QKD"]
+        FABRIC_NAME = dictObj["FABRIC_NAME"]
+
+        Wrapper.print("%s: FAB [%s]: ENABLE_DCI_MACSEC [%s] ENABLE_QKD [%s] ENABLE_DCI_MACSEC_PREV [%s]" %
+                      (funcName, FABRIC_NAME, ENABLE_DCI_MACSEC, ENABLE_QKD, ENABLE_DCI_MACSEC_PREV))
+
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        if ENABLE_DCI_MACSEC == "false" and ENABLE_DCI_MACSEC_PREV == "false":
+            return respObj
+
+        if ENABLE_DCI_MACSEC == "true" and ENABLE_QKD == "true":
+            return respObj
+
+        topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+        devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+        devices = filter(None, devices)
+        if len(devices) == 0:
+            return respObj
+
+        foundFailure = False
+        srchOpt = CtrlPolicySearch()
+        srchOpt.setTemplateName("dci_macsec_qkd_config")
+        for deviceSn in devices:
+            switchRole = topologyDataObj.getSwitchRole(deviceSn)
+            if switchRole == "spine" or switchRole == "super spine" or switchRole == "tor":
+                continue
+
+            srchOpt.setSerialNumber(deviceSn)
+            dciMACsecPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+            for pti in dciMACsecPtiList:
+                if pti.isDeleted():
+                    continue
+                nvPairs = pti.getNvPairs()
+                if ENABLE_DCI_MACSEC == "false":
+                    if nvPairs["USE_LINK_MACSEC"] == "false":
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "Cannot disable DCI MACsec as MACsec is configured on some DCI links using fabric settings", deviceSn)
+                        foundFailure = True
+                elif ENABLE_QKD == "false":
+                    if nvPairs["USE_LINK_MACSEC"] == "false" and nvPairs["ENABLE_QKD"] == "true":
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "Cannot disable DCI MACsec with QKD as QKD is configured on some DCI links using fabric settings", deviceSn)
+                        foundFailure = True
+
+        if foundFailure:
+            respObj.setFailureRetCode()
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def changeDCIQKDAllowedCheck(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        ENABLE_DCI_MACSEC = dictObj["ENABLE_DCI_MACSEC"]
+        ENABLE_QKD = dictObj["ENABLE_QKD"]
+        QKD_PROFILE_NAME = dictObj["QKD_PROFILE_NAME"].strip()
+        QKD_PROFILE_NAME_PREV = dictObj.get("QKD_PROFILE_NAME_PREV", "").strip()
+        FABRIC_NAME = dictObj["FABRIC_NAME"]
+
+        Wrapper.print("%s: FAB [%s]: ENABLE_DCI_MACSEC [%s] ENABLE_QKD [%s] QKD_PROFILE_NAME [%s] QKD_PROFILE_NAME_PREV [%s]" %
+                      (funcName, FABRIC_NAME, ENABLE_DCI_MACSEC, ENABLE_QKD, QKD_PROFILE_NAME, QKD_PROFILE_NAME_PREV))
+
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        if ENABLE_DCI_MACSEC == "false" or (ENABLE_DCI_MACSEC == "true" and ENABLE_QKD == "false"):
+            return respObj
+
+        if QKD_PROFILE_NAME == QKD_PROFILE_NAME_PREV:
+            return respObj
+
+        topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+        devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+        devices = filter(None, devices)
+        if len(devices) == 0:
+            return respObj
+
+        srchOpt = CtrlPolicySearch()
+        srchOpt.setTemplateName("dci_macsec_qkd_config")
+        for deviceSn in devices:
+            switchRole = topologyDataObj.getSwitchRole(deviceSn)
+            if switchRole == "spine" or switchRole == "super spine" or switchRole == "tor":
+                continue
+
+            srchOpt.setSerialNumber(deviceSn)
+            dciMACsecPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+            for pti in dciMACsecPtiList:
+                if pti.isDeleted():
+                    continue
+                nvPairs = pti.getNvPairs()
+                if nvPairs["USE_LINK_MACSEC"] == "true":
+                    if nvPairs["ENABLE_QKD"] == "true" and nvPairs["QKD_PROFILE_NAME"] == QKD_PROFILE_NAME:
+                        respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                            "Cannot set 'QKD Profile Name' to '%s' in fabric settings, found a DCI link on interface %s "
+                            "using same QKD profile name in link setting" % (QKD_PROFILE_NAME, nvPairs["INTF_NAME"]), deviceSn)
+                        respObj.setFailureRetCode()
+                        return respObj
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def checkSGTSettings(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        Wrapper.print("======== %s ==========" % funcName)
+        FABRIC_NAME           = dictObj["FABRIC_NAME"]
+        topologyDataObj       = dictObj.get("topologyDataObj")
+        devices               = dictObj.get("devices")
+        fabricSettings        = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ENABLE_SGT            = fabricSettings.get("ENABLE_SGT", "false")
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        if ENABLE_SGT != "true":
+            return respObj
+        
+        if not topologyDataObj:
+            topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+        if not devices:
+            devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+            devices = filter(None, devices)
+
+        for deviceSn in devices:
+            switchRole = topologyDataObj.getSwitchRole(deviceSn)
+            if switchRole == "spine" or switchRole == "super spine" or switchRole == "tor":
+                continue
+
+            devModel = topologyDataObj.getSwitchModel(deviceSn)
+            platformOK = False
+            if devModel.startswith("N9K") and ("-GX" in devModel or "FX3" in devModel or "-FX" in devModel or "-FX2" in devModel or "-H" in devModel or "-C9408" in devModel):
+                platformOK = True
+
+            if not platformOK:
+                respObj.addErrorReport(deviceSn + ":" + funcName,
+                                       "Platform does not support Security Groups. "
+                                       "Security Groups feature is only supported on fixed N9K GX/GX2/FX/FX2/FX3/H/C9408 platforms." , deviceSn)
+                respObj.setFailureRetCode()
+            else:
+                supported_version = "10.5(2)"
+
+                swVersionOk = Util.isSwVersionOk(deviceSn, supported_version)
+                if not swVersionOk:
+                    nxosImage = Util.exe(ImageManagementWrapper.getNXOSVersion(deviceSn))
+                    respObj.addErrorReport(deviceSn + ":" + funcName,
+                                        "Security Groups feature is supported from %s onwards, switch has %s" %
+                                        (supported_version, nxosImage), deviceSn)
+                    respObj.setFailureRetCode()
+
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def isValidV4IpAddr(addr):
+    try:
+        socket.inet_aton(addr)
+        return True
+    except socket.error:
+        return False
+
+def isValidV6IpAddr(addr):
+    try:
+        socket.inet_pton(socket.AF_INET6, addr)
+        return True
+    except socket.error:
+        return False
+
+def isValidHostname(hostname):
+    if len(hostname) > 233:
+        return False
+    if hostname.endswith("."): # A single trailing dot is legal
+        hostname = hostname[:-1] # strip exactly one dot from the right, if present
+    disallowed = re.compile("[^A-Z\d-]", re.IGNORECASE)
+    return all( # Split by labels and verify individually
+        (label and len(label) <= 233 # length is within proper range
+         and not label.startswith("-") and not label.endswith("-") # no bordering hyphens
+         and not disallowed.search(label)) # contains only legal characters
+        for label in hostname.split("."))
+
+def checkNxCloudSettings(dictObj):
+    funcName = sys._getframe(0).f_code.co_name
+    respObj = WrappersResp.getRespObj()
+    respObj.setSuccessRetCode()
+
+    isNxCloudFeatEnabled = Util.exe(FabricWrapper.isFeatureEnabled("nxcloud"))
+    Wrapper.print("%s: isNxCloudFeatEnabled=%r FABRIC_INIT=%r" % (funcName, isNxCloudFeatEnabled, dictObj["FABRIC_INIT"]))
+    if not isNxCloudFeatEnabled:
+        return respObj
+
+    FABRIC_NAME = dictObj["FABRIC_NAME"]
+    fabricSettings = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+    Wrapper.print("%s: FABRIC_NAME=%s fabricSettings=%s" % (funcName, FABRIC_NAME, fabricSettings))
+    ALLOW_NXC = fabricSettings.get("ALLOW_NXC", "false")
+    ALLOW_NXC_PREV = fabricSettings.get("ALLOW_NXC_PREV", "false")
+
+    if ALLOW_NXC != "true" and ALLOW_NXC_PREV == "true":
+        if Util.exe(FabricWrapper.isNxCloudImportedFabric(FABRIC_NAME)):
+            respObj.addErrorReport(funcName,
+                "Nexus Cloud settings may not be disabled from fabric [%s] as it is imported into Nexus Cloud." % FABRIC_NAME)
+            respObj.setFailureRetCode()
+            return respObj
+
+    if ALLOW_NXC != "true":
+        return respObj
+    
+    OVERWRITE_GLOBAL_NXC = fabricSettings.get("OVERWRITE_GLOBAL_NXC", "false")
+    if dictObj["FABRIC_INIT"] and OVERWRITE_GLOBAL_NXC != "true":
+        return respObj
+  
+    if dictObj["FABRIC_INIT"]:
+        NXC_DEST_VRF      = fabricSettings.get("NXC_DEST_VRF", "")
+        NXC_SRC_INTF      = fabricSettings.get("NXC_SRC_INTF", "")
+        NXC_PROXY_SERVER  = fabricSettings.get("NXC_PROXY_SERVER", "")
+        NXC_PROXY_PORT    = fabricSettings.get("NXC_PROXY_PORT", "")
+    else:
+        NXC_DEST_VRF      = dictObj.get("NXC_DEST_VRF", "")
+        NXC_SRC_INTF      = dictObj.get("NXC_SRC_INTF", "")
+        NXC_PROXY_SERVER  = dictObj.get("NXC_PROXY_SERVER", "")
+        NXC_PROXY_PORT    = dictObj.get("NXC_PROXY_PORT", "")
+    Wrapper.print("%s: NXC_DEST_VRF %s NXC_SRC_INTF %s NXC_PROXY_SERVER %s NXC_PROXY_PORT %s" %
+                  (funcName, NXC_DEST_VRF, NXC_SRC_INTF, NXC_PROXY_SERVER, NXC_PROXY_PORT))
+
+    supportedInterfaceTypes = ["Loopback", "Port-Channel", "Vlan"]
+ 
+    nxcDestVrf = ""
+    if NXC_DEST_VRF == "":
+        respObj.addErrorReport(funcName, "Intersight Destination VRF must be set for communication to Nexus Cloud, "
+                               "please set the Destination VRF in %s" %
+                               ("Global NxCloud Settings" if OVERWRITE_GLOBAL_NXC != "true" else "Fabric Settings"))
+        respObj.setFailureRetCode()
+    else:
+        nxcDestVrf = "default" if NXC_DEST_VRF.strip().lower() == "default" else NXC_DEST_VRF.strip()
+        if nxcDestVrf.lower() == "management":
+            nxcDestVrf = "management"
+        if nxcDestVrf != "management" and NXC_SRC_INTF == "":
+            respObj.addErrorReport(funcName, "Intersight Source Interface must be set if Destination VRF is not management, "
+                                   "please set the Source Interface in %s" %
+                                   ("Global NxCloud Settings" if OVERWRITE_GLOBAL_NXC != "true" else "Fabric Settings"))
+            respObj.setFailureRetCode()
+        if nxcDestVrf == "management" and NXC_SRC_INTF != "":
+            respObj.addErrorReport(funcName, "Intersight Source Interface [%s] should not be set if Destination VRF is management" %
+                                   (NXC_SRC_INTF))
+            respObj.setFailureRetCode()
+
+    if NXC_SRC_INTF != "" and nxcDestVrf != "" and nxcDestVrf != "management":
+        intfType = Util.getIntfFullType(NXC_SRC_INTF)
+        if intfType not in supportedInterfaceTypes:
+            respObj.addErrorReport(funcName, "Intersight Source Interface [%s] is not supported for communication to Nexus Cloud, "
+                                   "supported interfaces: loopback, port-channel, vlan" % NXC_SRC_INTF)
+            respObj.setFailureRetCode()
+        elif intfType == "Port-Channel" and "." in NXC_SRC_INTF:
+            respObj.addErrorReport(funcName, "Intersight Source Interface [%s] is not supported for communication to Nexus Cloud, "
+                                   "supported interfaces: loopback, port-channel (no sub-interface), vlan" % NXC_SRC_INTF)
+
+    if NXC_PROXY_SERVER != "":
+        proxyServer = NXC_PROXY_SERVER.strip()
+        if Util.isIpv6Addr(proxyServer):
+            if not isValidV6IpAddr(proxyServer):
+                respObj.addErrorReport(funcName, "Intersight Proxy Server [%s] is not a valid IPv6 server address" % proxyServer)
+                respObj.setFailureRetCode()
+        else:
+            digitFound = False
+            dotFound = False
+            otherFound = False
+            for char in proxyServer:
+                if char.isdigit():
+                    digitFound = True
+                elif char == ".":
+                    dotFound = True
+                else:
+                    otherFound = True
+            if digitFound and dotFound and not otherFound:
+                if not isValidV4IpAddr(proxyServer):
+                    respObj.addErrorReport(funcName, "Intersight Proxy Server [%s] is not a valid IPv4 server address" % proxyServer)
+                    respObj.setFailureRetCode()
+            elif not isValidHostname(proxyServer):
+                respObj.addErrorReport(funcName, "Intersight Proxy Server [%s] is not a valid DNS name. "
+                                       "DNS name (FQDN) must start and end with an alphanumeric character, "
+                                       "or end with a single trailing dot; "
+                                       "only special characters allowed are '.' or '-'" % proxyServer)
+                respObj.setFailureRetCode()
+
+    if NXC_PROXY_PORT != "":
+        proxyPortInt = int(NXC_PROXY_PORT)
+        if proxyPortInt < 1 or proxyPortInt > 65535:
+            respObj.addErrorReport(funcName, "Intersight Proxy Port [%s] is not a valid port number, valid range <1-65535>" % NXC_PROXY_PORT)
+            respObj.setFailureRetCode()
+
+    return respObj
+
+# caller provides FABRIC_NAME, DEVICES, topologyDataObj
+def nexusCloudConfigGen(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        FABRIC_NAME = dictObj["FABRIC_NAME"]
+        devices = dictObj["DEVICES"]
+        topologyDataObj = dictObj["topologyDataObj"]
+
+        fabricSettings = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ALLOW_NXC = fabricSettings.get("ALLOW_NXC", "false")
+
+        isNxCloudFeatEnabled = Util.exe(FabricWrapper.isFeatureEnabled("nxcloud"))
+        if not isNxCloudFeatEnabled or ALLOW_NXC != "true":
+            for deviceSn in devices:
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "nexus_cloud"))
+                for pti in ptiList:
+                    Util.exe(PTIWrapper.deleteInstance(pti.getPolicyId()))
+                ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "nxcloud_intersight_config", "nexus_cloud_internal"))
+                if ptiList:
+                    Util.exe(PTIWrapper.delete(deviceSn, "SWITCH", "SWITCH", "nxcloud_intersight_config", "nexus_cloud_internal"))
+            return respObj
+
+        OVERWRITE_GLOBAL_NXC = fabricSettings.get("OVERWRITE_GLOBAL_NXC", "false")
+        if OVERWRITE_GLOBAL_NXC == "true":
+            NXC_DEST_VRF      = fabricSettings.get("NXC_DEST_VRF", "")
+            NXC_SRC_INTF      = fabricSettings.get("NXC_SRC_INTF", "")
+            NXC_PROXY_SERVER  = fabricSettings.get("NXC_PROXY_SERVER", "")
+            NXC_PROXY_PORT    = fabricSettings.get("NXC_PROXY_PORT", "")
+        else:
+            nxcGlobalSettings = Util.exe(FabricWrapper.getNXCGlobalSettings())
+            Wrapper.print("%s: nxcGlobalSettings %s" % (funcName, nxcGlobalSettings))
+            NXC_DEST_VRF      = nxcGlobalSettings.get("sourceVrf", "")
+            NXC_SRC_INTF      = nxcGlobalSettings.get("sourceIntf", "")
+            NXC_PROXY_SERVER  = nxcGlobalSettings.get("proxyIp", "")
+            NXC_PROXY_PORT    = nxcGlobalSettings.get("proxyPort", "")
+        Wrapper.print("%s: NXC_SRC_INTF %s NXC_DEST_VRF %s NXC_PROXY_SERVER %s NXC_PROXY_PORT %s" %
+                      (funcName, NXC_SRC_INTF, NXC_DEST_VRF, NXC_PROXY_SERVER, NXC_PROXY_PORT))
+        
+        nxcDestVrf = "default" if NXC_DEST_VRF.strip().lower() == "default" else NXC_DEST_VRF.strip()
+        if nxcDestVrf.lower() == "management":
+            nxcDestVrf = "management"
+            NXC_SRC_INTF = ""   # Do not configure source-interface if destination VRF is management
+
+        nxcSrcIntf = ""
+        if NXC_SRC_INTF != "":
+            nxcSrcIntf = Util.getIntfFullName(NXC_SRC_INTF)
+            intfType = Util.getIntfFullType(NXC_SRC_INTF)
+            if intfType == "Loopback" or intfType == "Port-Channel":
+                nxcSrcIntf = nxcSrcIntf.lower()
+
+        l3IntfTemplates = ["int_loopback", "int_l3_port_channel", "int_vlan", "int_freeform"]
+
+        nonCloudDevices = []
+        for deviceSn in devices:
+            if not Util.isCloudScaleDevice(FABRIC_NAME, deviceSn, topologyDataObj):
+                hostName = topologyDataObj.get(TopologyInfoType.HOSTNAME, deviceSn)
+                nonCloudDevices.append(("%s(%s)" %(hostName,deviceSn)))
+                continue
+
+            if nxcSrcIntf != "":
+                ptiList = Util.exe(PTIWrapper.getPTIs(deviceSn, "INTERFACE", nxcSrcIntf, "PYTHON"))
+                if len(ptiList) == 0:
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                                           "Intersight Source Interface [%s] for communication to Nexus Cloud does not exist "
+                                           "or is not attached to any interface policy, "
+                                           "please create the interface and perform Recalculate Config again"
+                                           % nxcSrcIntf, deviceSn)
+                    respObj.setFailureRetCode()
+                    continue
+
+                if ptiList[0].getTemplateName() not in l3IntfTemplates:
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                                           "Intersight Source Interface [%s] for communication to Nexus Cloud must be a Layer-3 interface, "
+                                           "please edit the interface and make it L3 with proper config"
+                                           % nxcSrcIntf, deviceSn)
+                    respObj.setFailureRetCode()
+                    continue
+
+                intfIpFound = False
+                if ptiList[0].getTemplateName() != "int_freeform":
+                    INTF_VRF = ptiList[0].nvPairs.get("INTF_VRF", "")
+                    intfVrf = "default" if INTF_VRF == "" or INTF_VRF.strip().lower() == "default" else INTF_VRF.strip()
+                    ip = ptiList[0].nvPairs.get("IP", "")
+                    v6Ip = ptiList[0].nvPairs.get("V6IP", "")      # int_loopback
+                    if ip != "" or v6Ip != "":
+                        intfIpFound = True
+                    else:
+                        CONF = ptiList[0].nvPairs.get("CONF", "")
+                        cmds = CONF.splitlines()
+                        for cmd in cmds:
+                            cmd = re.sub(" +", " ", cmd.strip())
+                            if cmd.strip().startswith("ip address") or cmd.strip().startswith("ipv6 address"):
+                                intfIpFound = True
+                                break
+                else:
+                    intfVrf = "default"
+                    CONF = ptiList[0].nvPairs.get("CONF", "")
+                    cmds = CONF.splitlines()
+                    for cmd in cmds:
+                        cmd = re.sub(" +", " ", cmd.strip())
+                        if cmd.strip().startswith("vrf member"):
+                            ignore, intfVrf = cmd.split("vrf member ")
+                        elif cmd.strip().startswith("ip address") or cmd.strip().startswith("ipv6 address"):
+                            intfIpFound = True
+    
+                srcIntfError = False
+                if not intfIpFound:
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                                           "Intersight Source Interface [%s] for communication to Nexus Cloud must have an IP address, "
+                                           "please configure an IP address with proper config to the interface"
+                                           % nxcSrcIntf, deviceSn)
+                    respObj.setFailureRetCode()
+                    srcIntfError = True
+
+                if intfVrf != nxcDestVrf:
+                    respObj.addErrorReport(getFabErrEntity(funcName, deviceSn),
+                                           "Intersight Source Interface [%s] for communication to Nexus Cloud must be in the same VRF as "
+                                           "Intersight Destination VRF [%s], interface is in VRF [%s]"
+                                           % (nxcSrcIntf, nxcDestVrf, intfVrf), deviceSn)
+                    respObj.setFailureRetCode()
+                    srcIntfError = True
+
+                if srcIntfError:
+                    continue
+
+            Util.exe(PTIWrapper.createOrUpdate(deviceSn, "SWITCH", "SWITCH", "nxcloud_intersight_config", ConfigPriority.CONFIG_PRIO_UNDERLAY_MIDDLE,
+                                               "nexus_cloud_internal",
+                                               {"NXC_SRC_INTF": nxcSrcIntf,
+                                                "NXC_DEST_VRF": nxcDestVrf,
+                                                "NXC_PROXY_SERVER": NXC_PROXY_SERVER.strip() if NXC_PROXY_SERVER != "" else "",
+                                                "NXC_PROXY_PORT": NXC_PROXY_PORT}))
+            
+            showRunVrfMgmt = "false"
+            ptiList = Util.exe(PTIWrapper.get(deviceSn, "SWITCH", "SWITCH", "UNDERLAY", "nexus_cloud"))
+            for pti in ptiList:
+                ptiNvPairs = pti.getNvPairs()
+                ptiDestVrf = ptiNvPairs["NXC_DEST_VRF"]
+                if ptiDestVrf != "" and ptiDestVrf.strip().lower() == "management" and nxcDestVrf == "management":
+                    showRunVrfMgmt = ptiNvPairs["SHOW_RUN_VRF_MGMT"]
+
+            Util.exe(PTIWrapper.createOrUpdate(deviceSn, "SWITCH", "SWITCH", "UNDERLAY",
+                                               ConfigPriority.CONFIG_PRIO_UNDERLAY_MIDDLE,
+                                               "nexus_cloud",
+                                               {"NXC_SRC_INTF": nxcSrcIntf,
+                                                "NXC_DEST_VRF": nxcDestVrf if NXC_DEST_VRF != "" else "",
+                                                "NXC_PROXY_SERVER": NXC_PROXY_SERVER.strip() if NXC_PROXY_SERVER != "" else "",
+                                                "NXC_PROXY_PORT": NXC_PROXY_PORT,
+                                                "SHOW_RUN_VRF_MGMT": showRunVrfMgmt}))
+
+        if len(nonCloudDevices) > 0:
+            respObj.addWarnReport(getFabErrEntity(funcName, FABRIC_NAME+":# Non-Cloud Devices="+str(len(nonCloudDevices))),
+                                  "Nexus Cloud is only supported on N9K-C9332C, N9K-C9364C, "
+                                  "Nexus 9300-EX/FX/FXP/FX2/FX3/GX/GX2, 9500 and 9800 modular platforms. "
+                                  "Following devices do not support the Nexus Cloud feature: %s" %
+                                  (",".join(nonCloudDevices)))
+            respObj.setWarningRetCode()
+
+        return respObj
+    except respObjError as e:
+        return e.value
+
+# handle track, untrack and change the tracking fabric (btw MSD and child fabric)
+def siteIdTracking(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        FABRIC_NAME             = dictObj["FABRIC_NAME"]
+        parentFabricName        = dictObj.get("MSD_FABRIC_NAME", "")
+        fabricSettings          = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ENABLE_TRM              = fabricSettings.get("ENABLE_TRM", "false")
+        ENABLE_TRMv6            = fabricSettings.get("ENABLE_TRMv6", "false")
+        ALLOW_L3VNI_NO_VLAN     = fabricSettings.get("ALLOW_L3VNI_NO_VLAN", "false")
+        SITE_ID                 = fabricSettings.get("SITE_ID", "")
+        SITE_ID_POLICY_ID       = fabricSettings.get("SITE_ID_POLICY_ID", "")
+        UNDERLAY_IS_V6_TMPLT_VAR = fabricSettings.get("UNDERLAY_IS_V6", "false")
+        UNDERLAY_IS_V6 = UNDERLAY_IS_V6_TMPLT_VAR == "true"
+
+        Wrapper.print("%s [%s]: SITE_ID %s SITE_ID_POLICY_ID %s" %(funcName, FABRIC_NAME, SITE_ID, SITE_ID_POLICY_ID))
+
+        if (ENABLE_TRM == "true" or ENABLE_TRMv6 == "true") and (UNDERLAY_IS_V6 or ALLOW_L3VNI_NO_VLAN == "true"):
+            allocateMvpnVriId = True
+        else:
+            allocateMvpnVriId = False
+
+        if allocateMvpnVriId and SITE_ID and int(SITE_ID) < 65536:
+            if parentFabricName == "":
+                try:
+                    getRespObj = FabricWrapper.getParentFabricName(FABRIC_NAME)
+                    if getRespObj.isRetCodeSuccess():
+                        parentFabricName = getRespObj.getValue()
+                except:
+                    pass
+
+            trackFabricName = FABRIC_NAME
+            if parentFabricName:
+                msdFabricSettings = Util.exe(FabricWrapper.get(parentFabricName)).getNvPairs()
+                if msdFabricSettings.get("ENABLE_TRM_TRMv6", "false") == "true":
+                    trackFabricName = parentFabricName
+
+            Wrapper.print("%s: tracking fabric %s" %(funcName, trackFabricName))
+
+            # always do RM.set as we do not know whether SITE_ID is changed and which fabric tracked it
+            try:
+                ignore, rmId = Util.exeRM(RM.set(trackFabricName, "MVPN_VRI_ID", FABRIC_NAME, SITE_ID))
+            except:
+                Wrapper.print("%s exception on set site id %s in fabric %s"% (funcName, SITE_ID, trackFabricName))
+                errorMsg = "Site id [%s] is already used in fabric %s for either another site id or MVPN VRI ID. Please use a unique site id"% (SITE_ID, trackFabricName)
+                respObj.addErrorReport(funcName, errorMsg)
+                respObj.setFailureRetCode()
+                return respObj
+
+            if SITE_ID_POLICY_ID:
+                policyIdNum, oldRmId = SITE_ID_POLICY_ID.split(".")
+            else:
+                policyIdNum = oldRmId = ""
+
+            if oldRmId:
+                if int(oldRmId) != rmId:
+                    PTIWrapper.deletePtiVsRMForPolicyId(int(policyIdNum))
+                    Util.exeRM(RM.deleteResource(int(oldRmId)))
+                    Wrapper.print("%s released old RM id %s for fabric %s, policy %s"% (funcName, oldRmId, FABRIC_NAME, policyIdNum))
+
+                    RM.linkResource(int(policyIdNum), rmId)
+                    Wrapper.print("%s site id %s tracked in policyId %s, rmId %s, fabric %s" %(funcName, SITE_ID, policyIdNum, rmId, trackFabricName))
+                else:
+                    Wrapper.print("%s no change in RM id %s for fabric %s, policy %s"% (funcName, rmId, FABRIC_NAME, policyIdNum))
+            else:
+                if policyIdNum == "":
+                    policyIdNum = Util.exe(PTIWrapper.getPolicyID())
+                RM.linkResource(int(policyIdNum), rmId)
+
+            newPolicyStr = str(policyIdNum) + "." + str(rmId)
+            if newPolicyStr != SITE_ID_POLICY_ID:
+                Util.exe(FabricWrapper.update(FABRIC_NAME, "SITE_ID_POLICY_ID", newPolicyStr))
+        else:
+            Wrapper.print("%s site id %s, no tracking "% (funcName, SITE_ID))
+            if SITE_ID_POLICY_ID != "":
+                Wrapper.print("%s release RM tracking policy %s for site id %s"% (funcName, SITE_ID_POLICY_ID, SITE_ID))
+                policyIdNum, oldRmId = SITE_ID_POLICY_ID.split(".")
+                if oldRmId:
+                    PTIWrapper.deletePtiVsRMForPolicyId(int(policyIdNum))
+                    Util.exeRM(RM.deleteResource(int(oldRmId)))
+                    newPolicyStr = str(policyIdNum) + "."
+                    Util.exe(FabricWrapper.update(FABRIC_NAME, "SITE_ID_POLICY_ID", newPolicyStr))
+
+        return respObj
+    except respObjError as e:
+        Wrapper.print("%s [%s] site id %s, exception "% (funcName, FABRIC_NAME, SITE_ID))
+        return e.value
+
+# check whether ALLOW_L3VNI_NO_VLAN can be changed
+# do not allow changing it to false if any Mando VTEP present or any vrf has L3VNI_NO_VLAN
+def checkL3VniNoVlanSettings(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        Wrapper.print("======== %s ==========" % funcName)
+        FABRIC_NAME           = dictObj["FABRIC_NAME"]
+        fabricSettings        = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ALLOW_L3VNI_NO_VLAN   = fabricSettings.get("ALLOW_L3VNI_NO_VLAN", "true")
+        ALLOW_L3VNI_NO_VLAN_PREV   = fabricSettings.get("ALLOW_L3VNI_NO_VLAN_PREV", "true")
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+
+        if ALLOW_L3VNI_NO_VLAN == "true" or ALLOW_L3VNI_NO_VLAN == ALLOW_L3VNI_NO_VLAN_PREV:
+            return respObj
+
+        # check whether there is any vrf with L3VNI_NO_VLAN mode
+        mfdWrapper = MfdWrapper.getMfdWrapper()
+        mfdObj = mfdWrapper.getVrfList(FABRIC_NAME)
+        if mfdObj.isRetCodeSuccess():
+            fabricVrfList = mfdObj.getRespList()
+            for vrf in fabricVrfList:
+                vrfParams = vrf.get("vrfTemplateParams", None)
+                if vrfParams != None:
+                    enableL3VniNoVlan = vrfParams.get("enableL3VniNoVlan", "false")
+                    if enableL3VniNoVlan == "true":
+                        respObj.addErrorReport(funcName,
+                                           "'Allow L3VNI w/o VLAN' cannot be turned off when any vrf has 'Enable L3VNI w/o VLAN' turned on. 'Enable L3VNI w/o VLAN' is turned on for vrf %s. "% vrf.get("vrfName", ""))
+                        respObj.setFailureRetCode()
+                        return respObj
+
+        topologyDataObj = TopologyData(Util.exe(TopologyWrapper.get(FABRIC_NAME)))
+        devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+        devices = filter(None, devices)
+        for deviceSn in devices:
+            switchRole = topologyDataObj.getSwitchRole(deviceSn)
+            if switchRole == "spine" or switchRole == "super spine" or switchRole == "tor":
+                continue
+
+            devModel = topologyDataObj.getSwitchModel(deviceSn)
+            if devModel.startswith("N9K-C98"):
+                respObj.addErrorReport(funcName,
+                                       "'Allow L3VNI w/o VLAN' cannot be turned off when N9K-C9800 is present in the fabric as VTEP", deviceSn)
+                respObj.setFailureRetCode()
+                return respObj
+
+        return respObj
+    except respObjError as e:
+        return e.value
+
+def processMvpnVriRealloc(dictObj):
+    try:
+        funcName = sys._getframe(0).f_code.co_name
+        Wrapper.print("======== %s ==========" % funcName)
+        FABRIC_NAME           = dictObj["FABRIC_NAME"]
+        topologyDataObj       = dictObj["topologyDataObj"]
+        fabricSettings        = Util.exe(FabricWrapper.get(FABRIC_NAME)).getNvPairs()
+        ENABLE_TRM            = fabricSettings.get("ENABLE_TRM", "false")
+        ENABLE_TRMv6          = fabricSettings.get("ENABLE_TRMv6", "false")
+        ALLOW_L3VNI_NO_VLAN   = fabricSettings.get("ALLOW_L3VNI_NO_VLAN", "false")
+        MVPN_VRI_ID_RANGE     = fabricSettings.get("MVPN_VRI_ID_RANGE", "")
+
+        UNDERLAY_IS_V6_TMPLT_VAR = fabricSettings.get("UNDERLAY_IS_V6", "false")
+        UNDERLAY_IS_V6 = UNDERLAY_IS_V6_TMPLT_VAR == "true"
+
+        respObj = WrappersResp.getRespObj()
+        respObj.setSuccessRetCode()
+        
+        if (ENABLE_TRM == "true" or ENABLE_TRMv6 == "true") and (UNDERLAY_IS_V6 or ALLOW_L3VNI_NO_VLAN == "true"):
+            allocateMvpnVriId = True
+        else:
+            allocateMvpnVriId = False
+
+        if not allocateMvpnVriId:
+            return respObj
+
+        if MVPN_VRI_ID_RANGE == "":
+            Wrapper.print("%s [%s], empty MVPN_VRI_ID_RANGE"% (funcName, FABRIC_NAME))
+            respObj.addErrorReport(funcName, "Cannot re-allocate MVNP VRI ID for fabric %s with empty 'MVPN VRI ID Range'"%FABRIC_NAME)
+            respObj.setFailureRetCode()
+            return respObj
+
+        minVriId, maxVriId = MVPN_VRI_ID_RANGE.split("-")
+        devices = topologyDataObj.get(TopologyInfoType.SWITCHES)
+        devices = filter(None, devices)
+
+        srchOpt = CtrlPolicySearch()
+        srchOpt.setTemplateName("mvpn_vri_id_jython")
+        srchOpt2 = CtrlPolicySearch()
+        srchOpt2.setTemplateName("mvpn_vri_id")
+        for deviceSn in devices:
+            isSwitchVPC = Util.exe(VpcWrapper.isVpc(FABRIC_NAME, deviceSn))
+            if not isSwitchVPC:
+                continue
+
+            srchOpt.setSerialNumber(deviceSn)
+            ptiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+
+            for pti in ptiList:
+                vriId = pti.getNvPairs()["VRI_ID"]
+                if vriId >= minVriId and vriId <= maxVriId:
+                    continue
+                nvPairs = copy.deepcopy(pti.getNvPairs())
+                vpcPeerSn = nvPairs["VPC_PEER_SN"]
+                vpcPairSerialKey = Util.exe(Helper.getKey("DevicePair", deviceSn, vpcPeerSn))
+
+                ignore, rmId = Util.exeRM(RM.getSwitchMvpnVriId(FABRIC_NAME, "MVPN_VRI_ID", FABRIC_NAME, vpcPairSerialKey))
+                srchOpt2.setSerialNumber(deviceSn)
+                cliPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt2))
+                srchOpt2.setSerialNumber(vpcPeerSn)
+                cliPtiList += Util.exe(PTIWrapper.getPTIs(srchOpt2))
+                for cliPti in cliPtiList:
+                    Wrapper.print("%s [%s]: delete mvpn_vri_id %s CLI policy %s"%(funcName, cliPti.getSerialNumber(), vriId, cliPti.getPolicyId()))
+                    Util.exe(PTIWrapper.deleteInstance(cliPti.getPolicyId()))
+
+                Wrapper.print("%s: delete resource %s for VRI id %s"%(funcName, rmId, vriId))
+                Util.exeRM(RM.deleteResource(rmId))
+
+                mvpnVriId, newRmId = Util.exeRM(RM.getSwitchMvpnVriId(FABRIC_NAME, "MVPN_VRI_ID", FABRIC_NAME, vpcPairSerialKey))
+                Wrapper.print("%s [%s]: new VRI id %s, rmId %s"%(funcName, vpcPairSerialKey, mvpnVriId, newRmId))
+                nvPairs["VRI_ID"] = mvpnVriId
+                Util.exe(PTIWrapper.updateInstance(pti.getPolicyId(), nvPairs))
+
+                # update its VPC peer
+                srchOpt.setSerialNumber(vpcPeerSn)
+                peerPtiList = Util.exe(PTIWrapper.getPTIs(srchOpt))
+                for peerPti in peerPtiList:
+                    peerNvPairs = copy.deepcopy(peerPti.getNvPairs())
+                    peerNvPairs["VRI_ID"] = mvpnVriId
+                    Util.exe(PTIWrapper.updateInstance(peerPti.getPolicyId(), peerNvPairs))
+
+    except Exception as e:
+        respObj.addErrorReport(funcName,"Exception in " + funcName + " " + repr(e))
+        respObj.setFailureRetCode()
+        Wrapper.print("Exception in %s" % (funcName))
+    finally:
+        return respObj
+
+##
